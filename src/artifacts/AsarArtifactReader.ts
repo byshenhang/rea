@@ -41,7 +41,9 @@ export class AsarArtifactReader implements ArtifactReader {
   #headerSize: number | undefined;
   readonly #entries = new Map<string, AsarEntryState>();
   readonly #ownedHandles = new Map<SharedAsarFileHandle, OwnedAsarHandle>();
-  #snapshot: { readonly path: string; readonly sha256: string } | undefined;
+  #snapshot:
+    | { readonly path: string; readonly sha256: string; readonly bytes: number }
+    | undefined;
   #snapshotRoot: string | undefined;
   #snapshotOperation: Promise<void> = Promise.resolve();
 
@@ -312,6 +314,13 @@ export class AsarArtifactReader implements ArtifactReader {
     }, signal);
   }
 
+  /** Identity of the immutable snapshot backing every read, once captured. */
+  get snapshotIdentity():
+    | { readonly path: string; readonly sha256: string; readonly bytes: number }
+    | undefined {
+    return this.#snapshot;
+  }
+
   async close(): Promise<void> {
     await this.#withSnapshotOperation(() => this.#closeSnapshot());
   }
@@ -345,7 +354,12 @@ export class AsarArtifactReader implements ArtifactReader {
       const completedInput = inputHandle;
       inputHandle = undefined;
       await this.#closeOwnedHandle(completedInput);
-      this.#snapshot = { path: snapshotPath, sha256: hash.digest("hex") };
+      const snapshotBytes = (await lstat(snapshotPath)).size;
+      this.#snapshot = {
+        path: snapshotPath,
+        sha256: hash.digest("hex"),
+        bytes: snapshotBytes,
+      };
     } catch (cause: unknown) {
       let failure =
         signal?.aborted === true

@@ -36,6 +36,15 @@ export default defineConfig({
             text: "JavaScript workflows",
             link: "/javascript-application-workflows",
           },
+          { text: "REA Workbench design", link: "/rea-workbench-design" },
+          {
+            text: "REA Workbench development",
+            link: "/rea-workbench-development",
+          },
+          {
+            text: "REA Workbench follow-up tasks",
+            link: "/rea-workbench-follow-up-tasks",
+          },
           { text: "Browser observation", link: "/browser-observation" },
           { text: "Electron observation", link: "/electron-observation" },
           { text: "Process capture", link: "/process-capture" },

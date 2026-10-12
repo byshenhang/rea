@@ -41,6 +41,15 @@ For a first result from an extracted JavaScript application or ASAR:
 npx -y rea-agents@latest analyze-javascript-application /absolute/path/to/app --json
 ```
 
+要在浏览器中观察同一条分析流程，可使用本地 REA Workbench：
+
+```bash
+npm run workbench:build
+npm run workbench
+```
+
+设计基线见 [Workbench 产品与技术设计](./rea-workbench-design.md)，开发步骤见 [Workbench 开发文档](./rea-workbench-development.md)，后续接力任务见 [Workbench 后续开发任务](./rea-workbench-follow-up-tasks.md)。
+
 See [installation and setup](./installation.md) for requirements and configuration.
 
 For runtime instrumentation, see the [Frida guide](./frida-instrumentation.md).
