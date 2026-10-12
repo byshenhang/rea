@@ -105,6 +105,12 @@ export const createWorkbenchServer = (
       else response.destroy();
     });
   });
+  // Analysis runs CPU-bound phases in this same process. The default 5s
+  // keep-alive timer only fires once a blocked loop unblocks, reaping the
+  // connection right as the client's queued request writes to it. Local,
+  // single-user, loopback: hold connections well past those blocks.
+  server.keepAliveTimeout = 120_000;
+  server.headersTimeout = 125_000;
   return {
     server,
     store,
