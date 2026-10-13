@@ -571,11 +571,13 @@ it("serves parseable browser scripts with retry and safe graph node selection", 
     expect(response.status).toBe(200);
     const html = await response.text();
     const scripts = [...html.matchAll(/<script>([\s\S]*?)<\/script>/gu)];
-    expect(scripts).toHaveLength(2);
+    expect(scripts).toHaveLength(1);
     for (const [, source] of scripts)
       expect(() => new Script(source!)).not.toThrow();
     expect(html).toContain("重试运行");
-    expect(html).toContain("openNode(this.dataset.nodeId)");
+    // Node selection goes through delegated intents, never inline handlers.
+    expect(html).toContain('data-action="open-node"');
+    expect(html).not.toContain("onclick=");
   } finally {
     await server.handle.close();
   }

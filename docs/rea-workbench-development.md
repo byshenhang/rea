@@ -12,6 +12,7 @@ src/workbench/
 ├── sourceSnapshot.ts  # 运行级 ASAR 源码快照：固定身份、文件树、受限文本读取
 ├── bundleStore.ts     # Evidence Bundle：原子提交、摘要校验读取、孤儿回收
 ├── graphView.ts       # 图投影：分页、邻居、节点详情与跨运行差异（复用 REA 比较工作流）
+├── ui/                # 浏览器前端：state/client/render/app/bootstrap 模块（轻量 TS,无框架）
 ├── api.ts             # API 契约：错误封套、请求 Schema、响应类型
 └── types.ts           # 流程、运行、事件和步骤的共享类型
 ```
@@ -89,6 +90,13 @@ npm run workbench
 - 每次读取 Bundle 都重算 sha256，不匹配返回 `500 bundle_integrity_failed`；启动时删除 `.tmp-*` 孤儿、把无标记目录隔离为 `.incomplete-*`，删除失败保留现场并追加 `bundle-diagnostics.log`。
 - `/evidence`、`/export`、`/graph`、`/api/comparisons` 读取时 Bundle 优先、内联降级，契约不变。
 
+## 浏览器前端（src/workbench/ui）
+
+- 组件化采用轻量 TypeScript 模板路线:`state.ts` 定义类型化 UiState 与纯迁移(mergeEvents 去重、状态分类);`client.ts` 是类型化 API 客户端,把服务端错误封套解析为 `UiFailure`;`render.ts` 输出纯 HTML 字符串组件;`app.ts` 持有状态并处理事件委托与 SSE;`bootstrap.ts` 在运行时把编译产物拼接为经典脚本注入页面。构建链仍是 tsc,无前端框架。
+- 状态只来自服务端 API 与 RunEvent;刷新后经 `sessionStorage`(`rea-workbench:run-id` / `rea-workbench:event-cursor`)恢复当前运行,并以 `Last-Event-ID` 续传事件。
+- 错误封套(code/message/details)渲染为页面横幅;partial 完整性与 failed/unknown 清理状态有专门提示条。
+- 真实浏览器验收用 playwright-core 驱动本机 Chrome(`REA_BROWSER_EXECUTABLE` 可覆盖,默认按 Playwright 缓存与系统 Chrome 解析),覆盖创建项目→登记目标→运行→取消→Evidence→刷新重连。
+
 ## 图浏览与运行差异
 
 - 图证据经 REA 应用层 `parseApplicationGraphEvidence` 认证后投影；`node_id`/`edge_id` 是内容摘要（`jag_node_*`/`jag_edge_*`），同一内容跨运行稳定。
@@ -128,4 +136,5 @@ Workbench API 的契约与断线重连验收测试位于 `tests/boundary/workben
 - 图差异只比较 `analyze_javascript_application` 证据；native observations 侧通道（`left/right_native_observations`）暂未接入工作台差异。
 - ASAR 快照 reader 与其私有临时目录存活到服务进程关闭（`handle.close()` 统一释放）；崩溃后残留的 `rea-asar-snapshot-*` 临时目录由操作系统临时目录策略回收。
 - 累计读取预算在内存中计数，不跨服务重启保留。
+- 浏览器验收测试依赖本机 Chrome 二进制;CI 环境无 Chrome 时该套件会失败,属预期（`REA_BROWSER_EXECUTABLE` 可指向任意 Chrome 系可执行文件）。
 - SSE 去重按运行内序号单进程保证；跨进程多写者不在首期范围内。
