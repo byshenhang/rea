@@ -101,21 +101,22 @@ V1.1 的三个 P0.5 任务已全部完成（2026-10-13）：API 契约、幂等�
 - 清理失败不会覆盖原始分析错误：失败运行路径既有测试 + 提交失败降级路径测试（error 保持 null、诊断入事件流）。
 - 重启服务后已完成运行仍可查看和导出：同库同 Bundle 目录重启测试（覆盖）。
 
-## 任务 D：图浏览和运行差异（P1）
+## 任务 D：图浏览和运行差异（P1）— 已完成
 
-### 工作内容
+### 完成内容（2026-10-13）
 
-1. 提供分页节点、边和按邻居展开接口。
-2. 增加节点类型、观察、来源位置和 Evidence 引用展示。
-3. 比较两个运行的节点、边、Evidence 覆盖和限制差异。
-4. 增加筛选、搜索、路径定位和“只看变化”视图。
-5. 接入 React Flow、Cytoscape 或等价组件时，保持 API 和事件协议不变。
+1. `src/workbench/graphView.ts`：经 REA 应用层的 `parseApplicationGraphEvidence` 载入经认证的应用图（类型化节点/边），图差异完全复用 `compareApplicationVersionsEvidence` 工作流——匹配分层、unknown 处理、覆盖合并语义全部归 REA 所有，工作台只做分页与投影。
+2. 新增只读接口（全部游标分页，默认 100、上限 500）：`GET /api/runs/:id/graph/nodes`（`kind` 筛选 + `search` 子串搜索）、`/graph/edges`（`relation` 筛选）、`/graph/neighbors`（`node_id` + `direction=in|out|both` + 截断标志）、`/graph/nodes/:nodeId`（完整节点 + 入/出度）、`/graph/diff?against=<runId>`（`change=added|removed|changed|all`、`kind=node|edge|all`）。
+3. 节点与变更条目携带类型、标签、观察数、来源位置（observation evidence location）与 Evidence 引用（observation 级为空时回退引用运行图证据）；`POST /api/comparisons` 接受可选 `include_graph_diff`，响应在 `result.graph_diff` 附摘要与覆盖。
+4. 覆盖守卫：任一侧缺少可用的应用图证据时 diff 返回 `status:"unavailable"`、空 changes 与限制说明，不把缺失当作删除；两次运行持有同一份内容摘要 Evidence（相同目标内容）时同样返回 unavailable 并说明无版本差异。
+5. 浏览器 UI：图页支持搜索、类型筛选、分页加载（“加载更多”），节点点击显示入/出度与源码位置并可展开邻居；新增“差异”页（“只看变化”列表：新增/删除/修改计数 + 按运行与源码位置回溯），原“比较”按钮切换到该页。
+6. 测试 `tests/boundary/workbench/workbenchGraphDiff.test.ts`（7 个）：同目标两运行判定为同版本、跨目标增删条目回溯到运行/Evidence/源码位置、失败运行覆盖守卫、limit=1 游标翻页完整性、搜索与边筛选、邻居展开与节点详情、`include_graph_diff` 契约。
 
-### 验收标准
+### 验收标准核验
 
-- 大图不会一次性加载到浏览器导致页面失去响应。
-- 节点和边的变化可以回溯到运行、Evidence 和源码位置。
-- 对不完整结果显示明确的覆盖限制，不把缺失当作删除。
+- 大图不会一次性加载到浏览器：节点/边/变更全部游标分页（测试以 limit=1 翻页验证完整性），UI 每页 100 条。
+- 节点和边的变化可以回溯到运行、Evidence 和源码位置：变更条目断言 `right_run_id`、`evidence_links`、`locations` 含 `extra.js` 路径。
+- 对不完整结果不把缺失当作删除：覆盖守卫测试断言 unavailable + 空 changes + 限制说明。
 
 ## 任务 E：正式前端组件化（P1）
 

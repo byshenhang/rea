@@ -27,6 +27,18 @@ import {
   type WorkbenchSourceContent,
 } from "./api.js";
 import { WorkbenchBundleStore, defaultBundleRoot } from "./bundleStore.js";
+import { compareUnicodeCodePoints } from "../domain/unicodeCodePointOrder.js";
+import {
+  compareRunGraphs,
+  loadRunGraph,
+  nodeLocations,
+  nodeMatchesSearch,
+  page,
+  projectEdge,
+  projectNeighbors,
+  projectNode,
+  type LoadedRunGraph,
+} from "./graphView.js";
 import { WorkbenchRunManager } from "./runManager.js";
 import {
   WorkbenchStore,
@@ -252,6 +264,30 @@ const handleRequest = async (
       response,
       200,
       context.store.listRuns(url.searchParams.get("project_id") ?? undefined),
+    );
+  const graphRouteMatch = url.pathname.match(
+    /^\/api\/runs\/([^/]+)\/graph\/(nodes|edges|neighbors|diff)$/u,
+  );
+  if (graphRouteMatch !== null && request.method === "GET") {
+    const runId = decodeURIComponent(graphRouteMatch[1] ?? "");
+    const subresource = graphRouteMatch[2];
+    if (subresource === "nodes")
+      return getGraphNodes(response, context, runId, url);
+    if (subresource === "edges")
+      return getGraphEdges(response, context, runId, url);
+    if (subresource === "neighbors")
+      return getGraphNeighbors(response, context, runId, url);
+    return getGraphDiff(response, context, runId, url);
+  }
+  const graphNodeMatch = url.pathname.match(
+    /^\/api\/runs\/([^/]+)\/graph\/nodes\/([^/]+)$/u,
+  );
+  if (graphNodeMatch !== null && request.method === "GET")
+    return getGraphNodeDetail(
+      response,
+      context,
+      decodeURIComponent(graphNodeMatch[1] ?? ""),
+      decodeURIComponent(graphNodeMatch[2] ?? ""),
     );
   const runMatch = url.pathname.match(
     /^\/api\/runs\/([^/]+)(?:\/(steps|evidence|graph|files|source|export))?$/u,
@@ -505,6 +541,39 @@ const createComparison = async (
       ? rightResult.root_artifact_sha256
       : null;
   const comparable = leftRoot !== null && rightRoot !== null;
+  let graphDiff: Record<string, JsonValue> | null = null;
+  if (body.include_graph_diff === true) {
+    try {
+      const leftLoaded = loadRunGraph(context.bundles, context.store, left.id);
+      const rightLoaded = loadRunGraph(
+        context.bundles,
+        context.store,
+        right.id,
+      );
+      if (leftLoaded.status === "loaded" && rightLoaded.status === "loaded") {
+        const diff = compareRunGraphs({
+          left: leftLoaded.loaded.evidence,
+          right: rightLoaded.loaded.evidence,
+        });
+        graphDiff = {
+          comparison_id: diff.comparisonId,
+          summary: diff.summary,
+          coverage: diff.coverage,
+          limitations: [...diff.limitations],
+        };
+      } else {
+        graphDiff = {
+          summary: null,
+          limitations: ["至少一侧运行缺少可用的应用图证据，未推断增删。"],
+        };
+      }
+    } catch (cause: unknown) {
+      graphDiff = {
+        summary: null,
+        limitations: [`图差异计算失败：${describeError(cause)}`],
+      };
+    }
+  }
   const comparison: WorkbenchComparisonResponse = {
     comparison_id: `cmp_${left.id.slice(0, 8)}_${right.id.slice(0, 8)}`,
     comparable,
@@ -534,6 +603,7 @@ const createComparison = async (
       left: graphCounts(leftResult),
       right: graphCounts(rightResult),
       limitations: ["耗时差异仅为观测值，不能单独归因于源码修改。"],
+      ...(body.include_graph_diff === true ? { graph_diff: graphDiff } : {}),
     },
   };
   sendJson(response, 200, comparison);
@@ -603,6 +673,324 @@ const isAsarTarget = (target: {
   readonly format: "auto" | "asar" | "directory";
 }): boolean =>
   target.format === "asar" || target.path.toLowerCase().endsWith(".asar");
+
+const GRAPH_PAGE_DEFAULT = 100;
+const GRAPH_PAGE_MAX = 500;
+
+const graphPageLimit = (url: URL): number =>
+  boundedNumber(
+    url.searchParams.get("limit"),
+    GRAPH_PAGE_DEFAULT,
+    GRAPH_PAGE_MAX,
+  );
+
+const requireRunGraph = (
+  context: RequestContext,
+  runId: string,
+): LoadedRunGraph => {
+  const outcome = loadRunGraph(context.bundles, context.store, runId);
+  if (outcome.status === "missing")
+    throw new WorkbenchApiError(
+      "graph_not_available",
+      "该运行没有可用的应用图证据",
+    );
+  if (outcome.status === "invalid")
+    throw new WorkbenchApiError(
+      "graph_not_available",
+      `图证据不可用：${outcome.reason}`,
+    );
+  return outcome.loaded;
+};
+
+const getGraphNodes = (
+  response: ServerResponse,
+  context: RequestContext,
+  runId: string,
+  url: URL,
+): void => {
+  const { evidenceId, graph } = requireRunGraph(context, runId);
+  const kind = url.searchParams.get("kind");
+  const search = url.searchParams.get("search") ?? "";
+  let nodes = graph.nodes;
+  if (kind !== null) nodes = nodes.filter((node) => node.kind === kind);
+  if (search !== "")
+    nodes = nodes.filter((node) => nodeMatchesSearch(node, search));
+  const result = page(
+    nodes,
+    url.searchParams.get("cursor"),
+    graphPageLimit(url),
+  );
+  sendJson(response, 200, {
+    graph_id: graph.graph_id,
+    evidence_id: evidenceId,
+    coverage: graph.coverage,
+    limitations: [...graph.limitations],
+    total: result.total,
+    cursor: result.cursor,
+    nodes: result.items.map((node) => projectNode(node, evidenceId)),
+  });
+};
+
+const getGraphEdges = (
+  response: ServerResponse,
+  context: RequestContext,
+  runId: string,
+  url: URL,
+): void => {
+  const { evidenceId, graph } = requireRunGraph(context, runId);
+  const relation = url.searchParams.get("relation");
+  let edges = [...graph.edges].sort((left, right) =>
+    compareUnicodeCodePoints(left.edge_id, right.edge_id),
+  );
+  if (relation !== null)
+    edges = edges.filter((edge) => edge.relation === relation);
+  const result = page(
+    edges,
+    url.searchParams.get("cursor"),
+    graphPageLimit(url),
+  );
+  sendJson(response, 200, {
+    graph_id: graph.graph_id,
+    evidence_id: evidenceId,
+    coverage: graph.coverage,
+    limitations: [...graph.limitations],
+    total: result.total,
+    cursor: result.cursor,
+    edges: result.items.map(projectEdge),
+  });
+};
+
+const getGraphNeighbors = (
+  response: ServerResponse,
+  context: RequestContext,
+  runId: string,
+  url: URL,
+): void => {
+  const { evidenceId, graph } = requireRunGraph(context, runId);
+  const nodeId = url.searchParams.get("node_id") ?? "";
+  const directionParam = url.searchParams.get("direction") ?? "both";
+  if (nodeId === "")
+    throw new WorkbenchApiError("invalid_request", "node_id 为必填项", [
+      { path: "node_id", message: "缺少节点标识" },
+    ]);
+  if (
+    directionParam !== "in" &&
+    directionParam !== "out" &&
+    directionParam !== "both"
+  )
+    throw new WorkbenchApiError(
+      "invalid_request",
+      "direction 只接受 in、out 或 both",
+      [{ path: "direction", message: directionParam }],
+    );
+  const projection = projectNeighbors(
+    graph,
+    nodeId,
+    directionParam,
+    boundedNumber(url.searchParams.get("limit"), 50, GRAPH_PAGE_MAX),
+    evidenceId,
+  );
+  if (projection === null)
+    throw new WorkbenchApiError(
+      "graph_not_available",
+      "节点不存在于该运行的关系图中",
+      [{ path: "node_id", message: nodeId }],
+    );
+  sendJson(response, 200, {
+    graph_id: graph.graph_id,
+    evidence_id: evidenceId,
+    direction: directionParam,
+    ...projection,
+  });
+};
+
+const getGraphNodeDetail = (
+  response: ServerResponse,
+  context: RequestContext,
+  runId: string,
+  nodeId: string,
+): void => {
+  const { evidenceId, graph } = requireRunGraph(context, runId);
+  const node = graph.nodes.find((entry) => entry.node_id === nodeId);
+  if (node === undefined)
+    throw new WorkbenchApiError(
+      "graph_not_available",
+      "节点不存在于该运行的关系图中",
+      [{ path: "node_id", message: nodeId }],
+    );
+  sendJson(response, 200, {
+    graph_id: graph.graph_id,
+    evidence_id: evidenceId,
+    coverage: graph.coverage,
+    limitations: [...graph.limitations],
+    in_degree: graph.edges.filter((edge) => edge.target_node_id === nodeId)
+      .length,
+    out_degree: graph.edges.filter((edge) => edge.source_node_id === nodeId)
+      .length,
+    node: {
+      ...projectNode(node, evidenceId),
+      identity: node.identity as unknown as JsonValue,
+      observations: node.observations as unknown as JsonValue,
+    },
+  });
+};
+
+const requireRunForDiff = (context: RequestContext, runId: string): void => {
+  if (context.store.getRun(runId) === null)
+    throw new WorkbenchApiError("run_not_found", "运行不存在");
+};
+
+/**
+ * Diff change entries trace back to both runs: each carries the item identity,
+ * the run/evidence it came from, and the node's source locations.
+ */
+const getGraphDiff = (
+  response: ServerResponse,
+  context: RequestContext,
+  runId: string,
+  url: URL,
+): void => {
+  requireRunForDiff(context, runId);
+  const against = url.searchParams.get("against") ?? "";
+  if (against === "")
+    throw new WorkbenchApiError("invalid_request", "against 为必填项", [
+      { path: "against", message: "缺少要比较的运行 ID" },
+    ]);
+  requireRunForDiff(context, against);
+  const change = url.searchParams.get("change") ?? "all";
+  const kind = url.searchParams.get("kind") ?? "all";
+  if (
+    change !== "all" &&
+    change !== "added" &&
+    change !== "removed" &&
+    change !== "changed"
+  )
+    throw new WorkbenchApiError(
+      "invalid_request",
+      "change 只接受 added、removed、changed 或 all",
+      [{ path: "change", message: change }],
+    );
+  if (kind !== "all" && kind !== "node" && kind !== "edge")
+    throw new WorkbenchApiError(
+      "invalid_request",
+      "kind 只接受 node、edge 或 all",
+      [{ path: "kind", message: kind }],
+    );
+
+  const leftOutcome = loadRunGraph(context.bundles, context.store, runId);
+  const rightOutcome = loadRunGraph(context.bundles, context.store, against);
+  if (leftOutcome.status !== "loaded" || rightOutcome.status !== "loaded") {
+    const reasonFor = (outcome: typeof leftOutcome): string =>
+      outcome.status === "loaded"
+        ? "已有图证据"
+        : outcome.status === "missing"
+          ? "运行没有可用的应用图证据"
+          : `图证据不可用：${outcome.reason}`;
+    sendJson(response, 200, {
+      status: "unavailable",
+      left_run_id: runId,
+      right_run_id: against,
+      summary: null,
+      coverage: null,
+      limitations: [
+        `缺少完整图证据时不推断增删：左侧${reasonFor(leftOutcome)}；右侧${reasonFor(rightOutcome)}`,
+      ],
+      changes: [],
+      cursor: null,
+    });
+    return;
+  }
+
+  const left = leftOutcome.loaded;
+  const right = rightOutcome.loaded;
+  if (left.evidenceId === right.evidenceId) {
+    // Evidence identity is content-derived: both runs established the same
+    // application version, so there is no cross-version diff to infer.
+    sendJson(response, 200, {
+      status: "unavailable",
+      left_run_id: runId,
+      right_run_id: against,
+      summary: null,
+      coverage: null,
+      limitations: [
+        "两次运行持有同一份应用图证据（相同目标内容），不存在可比较的版本差异。",
+      ],
+      changes: [],
+      cursor: null,
+    });
+    return;
+  }
+  const diff = compareRunGraphs({ left: left.evidence, right: right.evidence });
+  const leftNodeById = new Map(
+    left.graph.nodes.map((node) => [node.node_id, node]),
+  );
+  const rightNodeById = new Map(
+    right.graph.nodes.map((node) => [node.node_id, node]),
+  );
+  const statusRank: Record<string, number> = {
+    added: 0,
+    removed: 1,
+    changed: 2,
+    unknown: 3,
+    unchanged: 4,
+  };
+  const changes = diff.items
+    .filter((item) => (change === "all" ? true : item.status === change))
+    .map((item) => {
+      const node =
+        item.right_node_id !== null
+          ? rightNodeById.get(item.right_node_id)
+          : item.left_node_id !== null
+            ? leftNodeById.get(item.left_node_id)
+            : undefined;
+      return {
+        item_id: item.item_id,
+        status: item.status,
+        node_kind: item.node_kind,
+        dimensions: item.dimensions,
+        left_run_id: item.left_node_id === null ? null : runId,
+        right_run_id: item.right_node_id === null ? null : against,
+        left_node_id: item.left_node_id,
+        right_node_id: item.right_node_id,
+        match: item.match,
+        evidence_links: item.evidence_links,
+        limitations: item.limitations,
+        locations: node === undefined ? [] : nodeLocations(node),
+      };
+    })
+    .filter((entry) =>
+      kind === "all"
+        ? true
+        : kind === "node"
+          ? entry.left_node_id !== null || entry.right_node_id !== null
+          : entry.left_node_id === null && entry.right_node_id === null,
+    )
+    .sort((a, b) => {
+      const rank =
+        (statusRank[String(a.status)] ?? 9) -
+        (statusRank[String(b.status)] ?? 9);
+      return rank !== 0
+        ? rank
+        : compareUnicodeCodePoints(String(a.item_id), String(b.item_id));
+    });
+  const result = page(
+    changes,
+    url.searchParams.get("cursor"),
+    graphPageLimit(url),
+  );
+  sendJson(response, 200, {
+    status: "compared",
+    left_run_id: runId,
+    right_run_id: against,
+    comparison_id: diff.comparisonId,
+    summary: diff.summary,
+    coverage: diff.coverage,
+    limitations: [...diff.limitations],
+    changes: result.items,
+    total: result.total,
+    cursor: result.cursor,
+  });
+};
 
 const getFiles = async (
   response: ServerResponse,
@@ -898,7 +1286,7 @@ const renderWorkbenchHtml = (token: string): string => `<!doctype html>
 <html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>REA Workbench</title><style>
 :root{color-scheme:dark;--bg:#0b1020;--panel:#121a2c;--panel2:#18233a;--line:#2a3857;--text:#e9efff;--muted:#91a0bd;--accent:#72a7ff;--ok:#55d6a1;--warn:#ffc56b;--bad:#ff7c92}*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font:14px/1.45 ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}button,input,select,textarea{font:inherit;color:inherit;background:#0e172b;border:1px solid var(--line);border-radius:7px;padding:8px 10px}button{cursor:pointer;background:#21345a;border-color:#395b97}button:hover{background:#2c4880}button.ghost{background:transparent}.shell{display:grid;grid-template-columns:300px 1fr;min-height:100vh}.sidebar{border-right:1px solid var(--line);padding:18px;background:#0d1528}.brand{font-weight:700;font-size:18px;letter-spacing:.02em;margin-bottom:18px}.muted{color:var(--muted)}.section{margin:18px 0}.section h3{font-size:12px;text-transform:uppercase;color:var(--muted);letter-spacing:.08em;margin:0 0 8px}.row{display:flex;gap:8px;align-items:center}.stack{display:flex;flex-direction:column;gap:8px}.project{padding:10px;border:1px solid transparent;border-radius:8px;cursor:pointer}.project.active{background:var(--panel2);border-color:#385385}.target,.run{padding:9px;border-top:1px solid var(--line);cursor:pointer}.target:hover,.run:hover{background:#15213a}.pill{display:inline-flex;align-items:center;border-radius:999px;padding:2px 8px;font-size:11px;background:#263657;color:var(--muted)}.pill.ok{color:#081b16;background:#55d6a1}.pill.warn{color:#211708;background:#ffc56b}.pill.bad{color:#260812;background:#ff7c92}.main{min-width:0}.topbar{display:flex;align-items:center;justify-content:space-between;padding:17px 22px;border-bottom:1px solid var(--line);background:#0d1528;position:sticky;top:0;z-index:2}.topbar h1{font-size:17px;margin:0}.content{padding:22px;max-width:1500px}.cards{display:grid;grid-template-columns:repeat(4,minmax(130px,1fr));gap:12px}.card{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:14px}.card .label{color:var(--muted);font-size:12px}.card .value{font-size:21px;font-weight:650;margin-top:5px}.workspace{display:grid;grid-template-columns:220px minmax(0,1fr) 320px;gap:14px;margin-top:14px}.panel{background:var(--panel);border:1px solid var(--line);border-radius:10px;min-height:180px;overflow:hidden}.panel h2{font-size:13px;padding:12px 14px;margin:0;border-bottom:1px solid var(--line)}.panel-body{padding:12px 14px}.steps{padding:6px 0}.step{display:flex;gap:8px;align-items:flex-start;padding:9px 12px}.step .dot{width:9px;height:9px;border-radius:50%;background:#415273;margin-top:5px;flex:none}.step.running .dot{background:var(--accent);box-shadow:0 0 0 4px #72a7ff22}.step.succeeded .dot{background:var(--ok)}.step.failed .dot{background:var(--bad)}.step .name{font-size:13px}.step .message{font-size:11px;color:var(--muted);margin-top:2px}.timeline{max-height:420px;overflow:auto}.event{padding:7px 0;border-bottom:1px solid #20304c;font-size:12px}.event strong{color:var(--accent);font-weight:550}.tabs{display:flex;gap:7px;margin:14px 0}.tabs button.active{background:#395b97}.tab{display:none}.tab.active{display:block}.graph{height:420px;overflow:auto;background:#0b1221;border-top:1px solid var(--line)}.node{display:flex;gap:8px;padding:7px 10px;border-bottom:1px solid #17243d;align-items:center}.node-kind{color:var(--accent);font-size:11px;min-width:135px}.node-label{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.code{white-space:pre-wrap;word-break:break-word;background:#0a1120;padding:14px;border-radius:8px;min-height:300px;overflow:auto;font:12px/1.6 ui-monospace,SFMono-Regular,Menlo,monospace}.empty{color:var(--muted);padding:18px;text-align:center}.form-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px}.form-grid label{display:flex;flex-direction:column;gap:5px;color:var(--muted);font-size:12px}.form-grid label.full{grid-column:1/-1}.form-actions{display:flex;gap:8px;justify-content:flex-end;margin-top:12px}@media(max-width:1100px){.shell{grid-template-columns:240px 1fr}.workspace{grid-template-columns:190px minmax(0,1fr)}.workspace>.panel:last-child{grid-column:1/-1}}@media(max-width:760px){.shell{display:block}.sidebar{border-right:0;border-bottom:1px solid var(--line)}.cards{grid-template-columns:repeat(2,1fr)}.workspace{display:block}.panel{margin-top:12px}}
 </style></head><body><div id="app"></div><script>window.__REA_WORKBENCH_TOKEN__=${JSON.stringify(token)};</script><script>
-const token=window.__REA_WORKBENCH_TOKEN__, state={projects:[],targets:[],runs:[],workflows:[],project:null,target:null,run:null,events:[],steps:[],graph:null,files:[],source:null,tab:'timeline',eventSource:null};
+const token=window.__REA_WORKBENCH_TOKEN__, state={projects:[],targets:[],runs:[],workflows:[],project:null,target:null,run:null,events:[],steps:[],graph:null,graphNodes:[],graphCursor:null,graphTotal:0,graphFilter:{search:'',kind:''},nodeDetail:null,nodeDetailId:null,diff:null,files:[],source:null,tab:'timeline',eventSource:null};
 const api=async(path,options={})=>{const res=await fetch(path,{...options,headers:{'Content-Type':'application/json','X-REA-Workbench-Token':token,...(options.headers||{})}});const data=await res.json();if(!res.ok)throw new Error(data.error?.message||'请求失败');return data};
 const esc=value=>String(value??'').replace(/[&<>'"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;',"'":'&#39;','"':'&quot;'}[c]));
 const fmtTime=value=>value?new Date(value).toLocaleString():'—';
@@ -906,16 +1294,25 @@ const statusClass=s=>['succeeded','complete'].includes(s)?'ok':['failed','cancel
 const statusText=s=>({queued:'排队中',starting:'启动中',running:'运行中',finalizing:'收尾中',succeeded:'成功',failed:'失败',cancelling:'取消中',cancelled:'已取消',interrupted:'已中断',unknown:'未知'}[s]||s);
 const render=()=>{document.getElementById('app').innerHTML=\`<div class="shell"><aside class="sidebar"><div class="brand">REA Workbench</div><div class="muted">本地分析与流程调试台</div><div class="section"><h3>项目</h3><div class="stack">\${state.projects.map(p=>\`<div class="project \${state.project?.id===p.id?'active':''}" onclick="selectProject('\${p.id}')"><div>\${esc(p.name)}</div><small class="muted">\${esc(p.description||'未填写说明')}</small></div>\`).join('')||'<div class="empty">还没有项目</div>'}</div><div class="form-actions"><button class="ghost" onclick="newProject()">+ 新建项目</button></div></div>\${state.project?'<div class="section"><h3>目标</h3><div class="stack">'+(state.targets.map(t=>\`<div class="target" onclick="selectTarget('\${t.id}')"><div>\${esc(t.path.split('/').pop()||t.path)}</div><small class="muted">\${esc(t.path)}</small></div>\`).join('')||'<div class="empty">登记目录或 ASAR</div>')+'</div><div class="form-actions"><button class="ghost" onclick="newTarget()">+ 登记目标</button></div></div>':''}<div class="section"><h3>最近运行</h3><div class="stack">\${state.runs.slice(0,8).map(r=>\`<div class="run" onclick="selectRun('\${r.id}')"><div class="row"><span class="pill \${statusClass(r.state)}">\${statusText(r.state)}</span><span class="muted">\${fmtTime(r.createdAt)}</span></div><small class="muted">\${esc(r.id.slice(0,8))} · \${esc(r.resultCompleteness)}</small></div>\`).join('')||'<div class="empty">暂无运行</div>'}</div></div></aside><main class="main"><header class="topbar"><div><h1>\${esc(state.run?'运行工作台':'项目首页')}</h1><div class="muted">\${esc(state.project?.name||'选择一个项目开始')}</div></div><div class="row">\${state.run?\`<span class="pill \${statusClass(state.run.state)}">\${statusText(state.run.state)}</span>\${['queued','starting','running','cancelling'].includes(state.run.state)?'<button onclick="cancelRun()">取消运行</button>':''}<button class="ghost" onclick="downloadEvidence()">导出</button><button class="ghost" onclick="compareCurrentRun()">比较</button>\` : ''}<button class="ghost" onclick="refresh()">刷新</button></div></header><section class="content">\${state.run?runView():homeView()}</section></main></div>\`};
 const homeView=()=>{const r=state.runs[0];return \`<div class="cards"><div class="card"><div class="label">目标</div><div class="value">\${state.targets.length}</div></div><div class="card"><div class="label">运行</div><div class="value">\${state.runs.length}</div></div><div class="card"><div class="label">成功</div><div class="value">\${state.runs.filter(x=>x.state==='succeeded').length}</div></div><div class="card"><div class="label">Provider</div><div class="value" style="font-size:15px">REA JS</div></div></div><div class="panel" style="margin-top:14px"><h2>开始一次分析</h2><div class="panel-body"><p class="muted">首期工作台复用 REA 的 JavaScript/Electron 静态分析工作流，不执行目标代码。</p>\${state.project?'<button onclick="newRun()">新建运行</button>':'<button onclick="newProject()">先创建项目</button>'}</div></div>\${r?'<div class="panel" style="margin-top:14px"><h2>最近运行</h2><div class="panel-body"><button onclick="selectRun(\\''+r.id+'\\')">打开最近运行</button></div></div>':''}\`};
-const runView=()=>{const summary=state.run.resultSummary||{},stats=summary.statistics||{};return \`<div class="cards"><div class="card"><div class="label">状态</div><div class="value"><span class="pill \${statusClass(state.run.state)}">\${statusText(state.run.state)}</span></div></div><div class="card"><div class="label">源码文件</div><div class="value">\${stats.parsed_javascript_files??'—'}</div></div><div class="card"><div class="label">模块</div><div class="value">\${stats.modules??'—'}</div></div><div class="card"><div class="label">Evidence</div><div class="value" style="font-size:12px;word-break:break-all">\${esc(state.run.evidenceId||'尚未生成')}</div></div></div><div class="tabs"><button class="\${state.tab==='timeline'?'active':''}" onclick="setTab('timeline')">执行时间线</button><button class="\${state.tab==='graph'?'active':''}" onclick="setTab('graph')">结果图</button><button class="\${state.tab==='source'?'active':''}" onclick="setTab('source')">源码</button><button class="\${state.tab==='evidence'?'active':''}" onclick="setTab('evidence')">Evidence</button></div><div class="workspace"><div class="panel"><h2>步骤</h2><div class="steps">\${state.steps.map(s=>\`<div class="step \${s.state}"><span class="dot"></span><div><div class="name">\${esc(s.name)}</div><div class="message">\${esc(s.message||statusText(s.state))}</div></div></div>\`).join('')||'<div class="empty">等待事件</div>'}</div></div><div class="panel"><h2>\${state.tab==='timeline'?'执行时间线':state.tab==='graph'?'关系图':state.tab==='source'?'源码查看':'Evidence 详情'}</h2><div class="panel-body"><div class="tab \${state.tab==='timeline'?'active':''}"><div class="timeline">\${state.events.slice().reverse().map(e=>\`<div class="event"><strong>\${esc(e.type)}</strong> <span class="muted">#\${e.sequence} · \${fmtTime(e.timestamp)}</span><div>\${esc(e.payload?.message||e.payload?.phase||e.payload?.state||'')}</div></div>\`).join('')||'<div class="empty">还没有事件</div>'}</div></div><div class="tab \${state.tab==='graph'?'active':''}"><div class="graph">\${state.graph?state.graph.nodes.map(n=>\`<div class="node"><span class="node-kind">\${esc(n.kind)}</span><span class="node-label">\${esc(n.observations?.[0]?.label||n.node_id)}</span></div>\`).join(''):'<div class="empty">切换到此页后加载关系图</div>'}</div></div><div class="tab \${state.tab==='source'?'active':''}"><div class="row"><select id="fileSelect" onchange="loadSource(this.value)"><option value="">选择源码文件</option>\${state.files.filter(f=>f.kind==='file').map(f=>\`<option value="\${esc(f.path)}">\${esc(f.path)}</option>\`).join('')}</select><button class="ghost" onclick="loadFiles()">刷新文件</button></div><p class="muted" style="font-size:11px">\${state.run.sourceSnapshot?.format==='asar'?\`读取自运行快照 <span class="pill">\${esc(String(state.run.sourceSnapshot.sha256).slice(0,12))}</span>（目标文件后续变化不影响本运行内容）\`:'读取自原始目标文件（只读，随目标变化）'}</p><pre class="code" id="sourceCode">\${esc(state.source?.content||'选择文件后查看；工作台只读显示源码。')}</pre></div><div class="tab \${state.tab==='evidence'?'active':''}"><pre class="code">\${esc(state.evidence?JSON.stringify(state.evidence,null,2):'切换到此页后加载 Evidence')}</pre></div></div></div><aside class="panel"><h2>上下文</h2><div class="panel-body"><p><span class="muted">目标</span><br>\${esc(state.target?.path||'—')}</p><p><span class="muted">流程</span><br>\${esc(state.run.workflowId)} @ \${esc(state.run.workflowVersion)}</p><p><span class="muted">开始</span><br>\${fmtTime(state.run.startedAt)}</p><p><span class="muted">结束</span><br>\${fmtTime(state.run.finishedAt)}</p><p><span class="muted">结果完整性</span><br><span class="pill \${statusClass(state.run.resultCompleteness)}">\${esc(state.run.resultCompleteness)}</span></p><p><span class="muted">清理</span><br>\${esc(state.run.cleanupStatus)}</p>\${state.run.error?'<p style="color:var(--bad)">'+esc(state.run.error.message)+'</p>':''}</div></aside></div>\`};
+const runView=()=>{const summary=state.run.resultSummary||{},stats=summary.statistics||{};return \`<div class="cards"><div class="card"><div class="label">状态</div><div class="value"><span class="pill \${statusClass(state.run.state)}">\${statusText(state.run.state)}</span></div></div><div class="card"><div class="label">源码文件</div><div class="value">\${stats.parsed_javascript_files??'—'}</div></div><div class="card"><div class="label">模块</div><div class="value">\${stats.modules??'—'}</div></div><div class="card"><div class="label">Evidence</div><div class="value" style="font-size:12px;word-break:break-all">\${esc(state.run.evidenceId||'尚未生成')}</div></div></div><div class="tabs"><button class="\${state.tab==='timeline'?'active':''}" onclick="setTab('timeline')">执行时间线</button><button class="\${state.tab==='graph'?'active':''}" onclick="setTab('graph')">结果图</button><button class="\${state.tab==='source'?'active':''}" onclick="setTab('source')">源码</button><button class="\${state.tab==='evidence'?'active':''}" onclick="setTab('evidence')">Evidence</button><button class="\${state.tab==='diff'?'active':''}" onclick="setTab('diff')">差异</button></div><div class="workspace"><div class="panel"><h2>步骤</h2><div class="steps">\${state.steps.map(s=>\`<div class="step \${s.state}"><span class="dot"></span><div><div class="name">\${esc(s.name)}</div><div class="message">\${esc(s.message||statusText(s.state))}</div></div></div>\`).join('')||'<div class="empty">等待事件</div>'}</div></div><div class="panel"><h2>\${state.tab==='timeline'?'执行时间线':state.tab==='graph'?'关系图':state.tab==='diff'?'运行差异':state.tab==='source'?'源码查看':'Evidence 详情'}</h2><div class="panel-body"><div class="tab \${state.tab==='timeline'?'active':''}"><div class="timeline">\${state.events.slice().reverse().map(e=>\`<div class="event"><strong>\${esc(e.type)}</strong> <span class="muted">#\${e.sequence} · \${fmtTime(e.timestamp)}</span><div>\${esc(e.payload?.message||e.payload?.phase||e.payload?.state||'')}</div></div>\`).join('')||'<div class="empty">还没有事件</div>'}</div></div><div class="tab \${state.tab==='graph'?'active':''}"><div class="row"><input id="graphSearch" placeholder="搜索节点（标签或 ID）" value="\${esc(state.graphFilter.search)}" onchange="applyGraphFilter()"><select id="graphKind" onchange="applyGraphFilter()"><option value="">全部类型</option>\${graphKindOptions()}</select><button class="ghost" onclick="applyGraphFilter()">筛选</button></div><div class="graph">\${graphNodesHtml()}</div></div><div class="tab \${state.tab==='diff'?'active':''}"><div class="row"><input id="diffAgainst" placeholder="对比的运行 ID" style="flex:1"><button onclick="runDiffFromInput()">比较</button></div><div class="graph">\${diffHtml()}</div></div><div class="tab \${state.tab==='source'?'active':''}"><div class="row"><select id="fileSelect" onchange="loadSource(this.value)"><option value="">选择源码文件</option>\${state.files.filter(f=>f.kind==='file').map(f=>\`<option value="\${esc(f.path)}">\${esc(f.path)}</option>\`).join('')}</select><button class="ghost" onclick="loadFiles()">刷新文件</button></div><p class="muted" style="font-size:11px">\${state.run.sourceSnapshot?.format==='asar'?\`读取自运行快照 <span class="pill">\${esc(String(state.run.sourceSnapshot.sha256).slice(0,12))}</span>（目标文件后续变化不影响本运行内容）\`:'读取自原始目标文件（只读，随目标变化）'}</p><pre class="code" id="sourceCode">\${esc(state.source?.content||'选择文件后查看；工作台只读显示源码。')}</pre></div><div class="tab \${state.tab==='evidence'?'active':''}"><pre class="code">\${esc(state.evidence?JSON.stringify(state.evidence,null,2):'切换到此页后加载 Evidence')}</pre></div></div></div><aside class="panel"><h2>上下文</h2><div class="panel-body"><p><span class="muted">目标</span><br>\${esc(state.target?.path||'—')}</p><p><span class="muted">流程</span><br>\${esc(state.run.workflowId)} @ \${esc(state.run.workflowVersion)}</p><p><span class="muted">开始</span><br>\${fmtTime(state.run.startedAt)}</p><p><span class="muted">结束</span><br>\${fmtTime(state.run.finishedAt)}</p><p><span class="muted">结果完整性</span><br><span class="pill \${statusClass(state.run.resultCompleteness)}">\${esc(state.run.resultCompleteness)}</span></p><p><span class="muted">清理</span><br>\${esc(state.run.cleanupStatus)}</p>\${state.run.error?'<p style="color:var(--bad)">'+esc(state.run.error.message)+'</p>':''}</div></aside></div>\`};
 async function refresh(){try{state.projects=await api('/api/projects');if(state.project)state.project=state.projects.find(p=>p.id===state.project.id)||state.projects[0]||null;else state.project=state.projects[0]||null;if(state.project)state.targets=await api('/api/projects/'+state.project.id+'/targets');state.runs=await api('/api/runs'+(state.project?'?project_id='+encodeURIComponent(state.project.id):''));if(state.run){state.run=await api('/api/runs/'+state.run.id);state.steps=await api('/api/runs/'+state.run.id+'/steps')}render()}catch(e){alert(e.message)}}
 async function selectProject(id){state.project=state.projects.find(p=>p.id===id)||null;state.run=null;state.target=null;await refresh()}
 async function selectTarget(id){state.target=state.targets.find(t=>t.id===id)||null;render()}
 async function selectRun(id){state.run=await api('/api/runs/'+id);state.project=state.projects.find(p=>p.id===state.run.projectId)||null;state.targets=state.project?await api('/api/projects/'+state.project.id+'/targets'):[];state.target=state.targets.find(t=>t.id===state.run.targetId)||null;state.steps=await api('/api/runs/'+id+'/steps');state.events=await api('/api/runs/'+id+'/events?format=json&after=0').catch(()=>[]);subscribe();render()}
-function setTab(tab){state.tab=tab;render();if(tab==='graph'&&!state.graph)loadGraph();if(tab==='evidence'&&!state.evidence)loadEvidence();if(tab==='source'&&!state.files.length)loadFiles()}
-async function loadGraph(){try{state.graph=await api('/api/runs/'+state.run.id+'/graph?limit=500');render()}catch(e){alert(e.message)}}
+function setTab(tab){state.tab=tab;render();if(tab==='graph'&&!state.graphNodes.length)loadGraphNodes(true);if(tab==='evidence'&&!state.evidence)loadEvidence();if(tab==='source'&&!state.files.length)loadFiles()}
+function graphKindOptions(){const kinds=[...new Set(state.graphNodes.map(n=>n.kind))];if(state.graphFilter.kind&&!kinds.includes(state.graphFilter.kind))kinds.push(state.graphFilter.kind);return kinds.map(k=>'<option value="'+esc(k)+'"'+(state.graphFilter.kind===k?' selected':'')+'>'+esc(k)+'</option>').join('')}
+function graphNodesHtml(){if(!state.graphNodes.length)return '<div class="empty">没有匹配的节点</div>';const rows=state.graphNodes.map(n=>'<div class="node" onclick="openNode(''+esc(n.node_id)+'')"><span class="node-kind">'+esc(n.kind)+'</span><span class="node-label">'+esc(n.label||n.node_id)+'</span></div>').join('');const more=state.graphCursor?'<div style="padding:8px;text-align:center"><button class="ghost" onclick="loadMoreGraph()">加载更多（已 '+state.graphNodes.length+'/'+state.graphTotal+'）</button></div>':'<div class="empty" style="font-size:11px">共 '+state.graphTotal+' 个节点</div>';const detail=state.nodeDetail?nodeDetailHtml():'';return rows+more+detail}
+function nodeDetailHtml(){const d=state.nodeDetail;const locs=(d.node&&d.node.locations||[]).map(l=>esc(typeof l==='string'?l:(l.path||JSON.stringify(l)))).join('<br>');return '<div style="border-top:1px solid var(--line);padding:10px"><div><strong>'+esc((d.node&&d.node.label)||state.nodeDetailId||'')+'</strong> <span class="pill">'+esc((d.node&&d.node.kind)||'')+'</span></div><div class="muted" style="font-size:11px">入边 '+d.in_degree+' · 出边 '+d.out_degree+' · 图 '+esc(String(d.graph_id||'').slice(0,12))+'</div><div class="muted" style="font-size:11px;word-break:break-all">'+(locs||'无源码位置')+'</div><div style="margin-top:6px"><button class="ghost" onclick="expandNeighbors()">展开邻居</button> <button class="ghost" onclick="state.nodeDetail=null;render()">关闭</button></div></div>'}
+async function loadGraphNodes(reset){try{if(reset){state.graphNodes=[];state.graphCursor=null}const params=new URLSearchParams({limit:'100'});if(state.graphFilter.search)params.set('search',state.graphFilter.search);if(state.graphFilter.kind)params.set('kind',state.graphFilter.kind);if(!reset&&state.graphCursor)params.set('cursor',state.graphCursor);const pageData=await api('/api/runs/'+state.run.id+'/graph/nodes?'+params.toString());const seen=new Set(state.graphNodes.map(n=>n.node_id));for(const n of pageData.nodes)if(!seen.has(n.node_id)){state.graphNodes.push(n);seen.add(n.node_id)}state.graphCursor=pageData.cursor;state.graphTotal=pageData.total;render()}catch(e){alert(e.message)}}
+async function loadMoreGraph(){await loadGraphNodes(false)}
+async function applyGraphFilter(){state.graphFilter={search:document.getElementById('graphSearch')?document.getElementById('graphSearch').value:'',kind:document.getElementById('graphKind')?document.getElementById('graphKind').value:''};await loadGraphNodes(true)}
+async function openNode(id){try{state.nodeDetail=await api('/api/runs/'+state.run.id+'/graph/nodes/'+encodeURIComponent(id));state.nodeDetailId=id;render()}catch(e){alert(e.message)}}
+async function expandNeighbors(){const target=state.nodeDetailId||(state.nodeDetail&&state.nodeDetail.node&&state.nodeDetail.node.node_id);if(!target)return;try{const data=await api('/api/runs/'+state.run.id+'/graph/neighbors?node_id='+encodeURIComponent(target)+'&limit=50');const seen=new Set(state.graphNodes.map(n=>n.node_id));for(const n of data.nodes)if(!seen.has(n.node_id)){state.graphNodes.push(n);seen.add(n.node_id)}alert('展开邻居 '+data.nodes.length+' 个'+(data.truncated?'（已截断）':''));render()}catch(e){alert(e.message)}}
+function diffHtml(){const d=state.diff;if(!d)return '<div class="empty">输入另一个运行 ID，比较节点与边变化</div>';if(d.status!=='compared')return '<div class="empty">'+esc((d.limitations||[]).join('；')||'差异不可用')+'</div>';const s=d.summary;const rows=(d.changes||[]).map(c=>{const loc=(c.locations||[])[0];const where=loc?(typeof loc==='string'?loc:(loc.path||JSON.stringify(loc))):(c.right_node_id||c.left_node_id||'');return '<div class="event"><strong>'+esc(c.status)+'</strong> <span class="muted">'+esc(c.node_kind)+'</span><div>'+esc(where)+'</div></div>'}).join('')||'<div class="empty">两运行的节点没有变化</div>';return '<div class="cards" style="grid-template-columns:repeat(5,minmax(0,1fr))"><div class="card"><div class="label">新增</div><div class="value">'+s.added+'</div></div><div class="card"><div class="label">删除</div><div class="value">'+s.removed+'</div></div><div class="card"><div class="label">修改</div><div class="value">'+s.changed+'</div></div><div class="card"><div class="label">未变</div><div class="value">'+s.unchanged+'</div></div><div class="card"><div class="label">未知</div><div class="value">'+s.unknown+'</div></div></div><div class="muted" style="font-size:11px;margin:8px 0">覆盖：'+esc(String((d.coverage&&d.coverage.status)||'—'))+((d.limitations||[]).length?'；'+esc(d.limitations.join('；')):'')+'</div><div class="timeline" style="max-height:320px">'+rows+'</div>'}
+async function runDiffFromInput(){const input=document.getElementById('diffAgainst');if(!input||!input.value)return;try{state.diff=await api('/api/runs/'+state.run.id+'/graph/diff?against='+encodeURIComponent(input.value.trim())+'&change=all&limit=50');render()}catch(e){alert(e.message)}}
 async function loadEvidence(){try{state.evidence=await api('/api/runs/'+state.run.id+'/evidence');render()}catch(e){alert(e.message)}}
 async function downloadEvidence(){if(!state.run)return;try{const res=await fetch('/api/runs/'+state.run.id+'/export',{headers:{'X-REA-Workbench-Token':token}});if(!res.ok)throw new Error('Evidence 尚未生成');const blob=await res.blob();const link=document.createElement('a');link.href=URL.createObjectURL(blob);link.download='rea-workbench-'+state.run.id+'.json';link.click();URL.revokeObjectURL(link.href)}catch(e){alert(e.message)}}
-async function compareCurrentRun(){if(!state.run)return;const other=prompt('输入要比较的另一个运行 ID');if(!other)return;try{const comparison=await api('/api/comparisons',{method:'POST',body:JSON.stringify({left_run_id:state.run.id,right_run_id:other.trim()})});alert(JSON.stringify(comparison,null,2))}catch(e){alert(e.message)}}
+async function compareCurrentRun(){state.tab='diff';render();setTimeout(()=>{const input=document.getElementById('diffAgainst');if(input)input.focus()},0)}
 async function loadFiles(){try{state.files=await api('/api/runs/'+state.run.id+'/files');render()}catch(e){alert(e.message)}}
 async function loadSource(path){if(!path)return;try{state.source=await api('/api/runs/'+state.run.id+'/source?path='+encodeURIComponent(path));render()}catch(e){alert(e.message)}}
 function subscribe(){if(state.eventSource)state.eventSource.close();if(!state.run)return;state.eventSource=new EventSource('/api/runs/'+state.run.id+'/events?token='+encodeURIComponent(token)+'&after='+(state.events.at(-1)?.sequence||0));state.eventSource.addEventListener('step.progress',onEvent);state.eventSource.addEventListener('step.started',onEvent);state.eventSource.addEventListener('step.finished',onEvent);state.eventSource.addEventListener('run.finished',onEvent);state.eventSource.addEventListener('diagnostic.reported',onEvent);state.eventSource.addEventListener('evidence.recorded',onEvent)}

@@ -10,6 +10,7 @@ src/workbench/
 ├── runManager.ts      # 单 Worker 队列、取消、REA workflow 适配和清理
 ├── sourceSnapshot.ts  # 运行级 ASAR 源码快照：固定身份、文件树、受限文本读取
 ├── bundleStore.ts     # Evidence Bundle：原子提交、摘要校验读取、孤儿回收
+├── graphView.ts       # 图投影：分页、邻居、节点详情与跨运行差异（复用 REA 比较工作流）
 ├── api.ts             # API 契约：错误封套、请求 Schema、响应类型
 └── types.ts           # 流程、运行、事件和步骤的共享类型
 ```
@@ -77,6 +78,13 @@ npm run workbench
 - 每次读取 Bundle 都重算 sha256，不匹配返回 `500 bundle_integrity_failed`；启动时删除 `.tmp-*` 孤儿、把无标记目录隔离为 `.incomplete-*`，删除失败保留现场并追加 `bundle-diagnostics.log`。
 - `/evidence`、`/export`、`/graph`、`/api/comparisons` 读取时 Bundle 优先、内联降级，契约不变。
 
+## 图浏览与运行差异
+
+- 图证据经 REA 应用层 `parseApplicationGraphEvidence` 认证后投影；`node_id`/`edge_id` 是内容摘要（`jag_node_*`/`jag_edge_*`），同一内容跨运行稳定。
+- 分页接口（默认 100、上限 500，`cursor` 为偏移游标）：`/graph/nodes`（`kind`、`search`）、`/graph/edges`（`relation`）、`/graph/neighbors`（`node_id`、`direction`、截断标志）、`/graph/nodes/:nodeId`（入/出度）。
+- `/graph/diff?against=<runId>` 复用 `compareApplicationVersionsEvidence`：返回匹配分层摘要（unchanged/added/removed/changed/unknown）、覆盖状态与变更条目（含运行、Evidence 链接与源码位置）。任一侧图证据缺失或两次运行证据相同（内容摘要相同）时返回 `status:"unavailable"`，不把缺失或同版本当作增删。
+- `POST /api/comparisons` 可选 `include_graph_diff: true` 在 `result.graph_diff` 返回同一摘要。
+
 ## 源码快照与读取限制
 
 - **ASAR 目标**：运行启动时（目标检查步骤之后）通过 REA 的 `AsarArtifactReader` 把档案复制进私有快照目录，固定身份 `{format:"asar", sha256, bytes}` 写入运行记录并发 `artifact.available` 事件；文件树与文本读取全部来自该快照，目标档案后续变化不影响本运行内容。快照建立失败不中断分析，仅记录 `diagnostic.reported`。
@@ -94,13 +102,15 @@ npm run check:fast
 npm run test:focused -- tests/boundary/workbench/workbenchApiContract.test.ts tests/boundary/workbench/workbenchSseReconnect.test.ts
 npm run test:focused -- tests/boundary/workbench/workbenchAsarSource.test.ts
 npm run test:focused -- tests/boundary/workbench/workbenchEvidenceBundle.test.ts
+npm run test:focused -- tests/boundary/workbench/workbenchGraphDiff.test.ts
 ```
 
-Workbench API 的契约与断线重连验收测试位于 `tests/boundary/workbench/`：契约测试在真实 loopback HTTP 服务器上覆盖鉴权、非法请求不写部分实体、幂等重放与冲突、真实 REA 分析的成功/失败/取消三条路径；SSE 测试用 `handle.store` 注入确定性事件，覆盖历史回放、实时合并不丢不重和 `Last-Event-ID`/`after` 续传；ASAR 测试用 `@electron/asar` 构造真实档案并跑完整分析，覆盖快照身份固定（覆盖目标后读取不变）、文件树、穿越拒绝、文本限制和读取预算。Bundle 测试覆盖原子提交、清单追溯、数据库分离、重启后读取、孤儿回收、篡改检测和提交失败降级。存储模块语义（事件顺序、步骤投影、幂等绑定）的单元测试在 `src/server/workbenchStore.test.ts`。不要用模拟 Provider 宣称真实 REA Provider 已验证。
+Workbench API 的契约与断线重连验收测试位于 `tests/boundary/workbench/`：契约测试在真实 loopback HTTP 服务器上覆盖鉴权、非法请求不写部分实体、幂等重放与冲突、真实 REA 分析的成功/失败/取消三条路径；SSE 测试用 `handle.store` 注入确定性事件，覆盖历史回放、实时合并不丢不重和 `Last-Event-ID`/`after` 续传；ASAR 测试用 `@electron/asar` 构造真实档案并跑完整分析，覆盖快照身份固定（覆盖目标后读取不变）、文件树、穿越拒绝、文本限制和读取预算。Bundle 测试覆盖原子提交、清单追溯、数据库分离、重启后读取、孤儿回收、篡改检测和提交失败降级。图差异测试覆盖同版本判定、增删回溯、覆盖守卫、游标翻页、邻居展开与 `include_graph_diff` 契约。存储模块语义（事件顺序、步骤投影、幂等绑定）的单元测试在 `src/server/workbenchStore.test.ts`。不要用模拟 Provider 宣称真实 REA Provider 已验证。
 
 ## 已知限制
 
-- Evidence Bundle 每次读取都重算 sha256，超大规模 Bundle 的读取成本随体积线性增长；分块读取与分页属任务 D 后的图/分页工作。
+- Evidence Bundle 每次读取都重算 sha256，超大规模 Bundle 的读取成本随体积线性增长。
+- 图差异只比较 `analyze_javascript_application` 证据；native observations 侧通道（`left/right_native_observations`）暂未接入工作台差异。
 - ASAR 快照 reader 与其私有临时目录存活到服务进程关闭（`handle.close()` 统一释放）；崩溃后残留的 `rea-asar-snapshot-*` 临时目录由操作系统临时目录策略回收。
 - 累计读取预算在内存中计数，不跨服务重启保留。
 - SSE 去重按运行内序号单进程保证；跨进程多写者不在首期范围内。

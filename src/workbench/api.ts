@@ -178,6 +178,7 @@ export const createRunBodySchema = z.object({
 export const createComparisonBodySchema = z.object({
   left_run_id: z.string().min(1).max(128),
   right_run_id: z.string().min(1).max(128),
+  include_graph_diff: z.boolean().optional(),
 });
 
 /** Parse a JSON object body and validate it against a schema. */
@@ -296,6 +297,8 @@ export interface WorkbenchComparisonResponse {
     readonly left: Record<string, JsonValue>;
     readonly right: Record<string, JsonValue>;
     readonly limitations: readonly string[];
+    /** Present only when the caller asked include_graph_diff. */
+    readonly graph_diff?: Record<string, JsonValue> | null;
   };
 }
 
