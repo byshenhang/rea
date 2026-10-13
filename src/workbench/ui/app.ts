@@ -194,6 +194,8 @@ export class WorkbenchApp {
       filesPrefix: "",
       source: null,
       evidence: null,
+      graphError: null,
+      evidenceError: null,
       error: null,
     });
     this.#sessionStorage?.setItem(SESSION_RUN_KEY, runId);
@@ -522,8 +524,19 @@ export class WorkbenchApp {
         };
       });
     } catch (error) {
-      this.#patch({ graphLoading: false });
-      throw error;
+      // A run without a graph keeps its tab open with an inline explanation
+      // instead of only a transient banner.
+      this.#patch({
+        graphLoading: false,
+        graphError: {
+          message:
+            error instanceof api.UiFailure
+              ? error.banner.message
+              : error instanceof Error
+                ? error.message
+                : String(error),
+        },
+      });
     }
   }
 
@@ -585,10 +598,20 @@ export class WorkbenchApp {
     this.#patch({ evidenceLoading: true });
     try {
       const evidence = await api.getEvidence(this.#client, run.id);
-      this.#patch({ evidence, evidenceLoading: false });
+      this.#patch({ evidence, evidenceLoading: false, evidenceError: null });
     } catch (error) {
-      this.#patch({ evidenceLoading: false, evidence: null });
-      throw error;
+      this.#patch({
+        evidenceLoading: false,
+        evidence: null,
+        evidenceError: {
+          message:
+            error instanceof api.UiFailure
+              ? error.banner.message
+              : error instanceof Error
+                ? error.message
+                : String(error),
+        },
+      });
     }
   }
 

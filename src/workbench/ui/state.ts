@@ -114,6 +114,7 @@ export interface UiState {
   readonly graphTotal: number;
   readonly graphFilter: UiGraphFilter;
   readonly graphLoading: boolean;
+  readonly graphError: { readonly message: string } | null;
   readonly nodeDetail: UiNodeDetail | null;
   readonly nodeDetailId: string | null;
   readonly diff: UiDiff | null;
@@ -133,6 +134,7 @@ export interface UiState {
   } | null;
   readonly evidence: JsonValue | null;
   readonly evidenceLoading: boolean;
+  readonly evidenceError: { readonly message: string } | null;
 }
 
 export const initialUiState = (): UiState => ({
@@ -152,6 +154,7 @@ export const initialUiState = (): UiState => ({
   graphTotal: 0,
   graphFilter: { search: "", kind: "" },
   graphLoading: false,
+  graphError: null,
   nodeDetail: null,
   nodeDetailId: null,
   diff: null,
@@ -161,6 +164,7 @@ export const initialUiState = (): UiState => ({
   source: null,
   evidence: null,
   evidenceLoading: false,
+  evidenceError: null,
 });
 
 /** Dedupe by run-internal sequence and keep ascending order. */

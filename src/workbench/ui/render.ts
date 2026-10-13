@@ -89,7 +89,7 @@ export const sidebar = (state: UiState): string => {
     .slice(0, 8)
     .map(
       (run) =>
-        `<div class="run" tabindex="0" role="button" data-run-id="${esc(run.id)}" data-action="select-run"><div class="row">${pill(run.state)}<span class="muted">${fmtTime(run.createdAt)}</span></div><small class="muted">${esc(run.id.slice(0, 8))} · ${esc(run.resultCompleteness)}</small></div>`,
+        `<div class="run" tabindex="0" role="button" data-run-id="${esc(run.id)}" data-action="select-run"><div class="row">${pill(run.state)}<span class="muted">${fmtTime(run.createdAt)}</span></div><small class="muted">${esc(run.id.slice(0, 8))} · ${esc(run.resultCompleteness)}${run.state === "succeeded" ? "" : " · 无结果"}</small></div>`,
     )
     .join("");
   return `<aside class="sidebar"><div class="brand">REA Workbench</div><div class="muted">本地分析与流程调试台</div><div class="section"><h3>项目</h3><div class="stack">${projects || '<div class="empty">还没有项目</div>'}</div><div class="form-actions"><button class="ghost" data-action="new-project">+ 新建项目</button></div></div>${targets}<div class="section"><h3>最近运行</h3><div class="stack">${runs || '<div class="empty">暂无运行</div>'}</div></div></aside>`;
@@ -150,6 +150,10 @@ const stepsPanel = (state: UiState): string =>
 const graphTab = (state: UiState): string => {
   if (state.graphLoading && state.graphNodes.length === 0)
     return '<div class="loading">关系图载入中…</div>';
+  if (state.graphError !== null)
+    return `<div class="empty" data-testid="graph-unavailable">${esc(
+      state.graphError.message,
+    )}<br><span class="muted" style="font-size:11px">只有状态为成功的运行会生成应用关系图。</span></div>`;
   const rows =
     state.graphNodes
       .map(
@@ -249,6 +253,10 @@ const sourceTab = (state: UiState): string => {
 const evidenceTab = (state: UiState): string => {
   if (state.evidenceLoading)
     return '<div class="loading">Evidence 载入中…</div>';
+  if (state.evidenceError !== null)
+    return `<div class="empty" data-testid="evidence-unavailable">${esc(
+      state.evidenceError.message,
+    )}<br><span class="muted" style="font-size:11px">取消或失败的运行没有 Evidence;重试运行成功后即可查看。</span></div>`;
   return `<pre class="code" data-testid="evidence-content">${esc(state.evidence === null ? "切换到此页后加载 Evidence" : JSON.stringify(state.evidence, null, 2))}</pre>`;
 };
 
