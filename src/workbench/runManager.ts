@@ -100,6 +100,39 @@ export class WorkbenchRunManager {
     this.#lastStartupRecovery = report;
   }
 
+  /**
+   * Rebuild in-memory ASAR source snapshots for runs that recorded one before
+   * the last process exit. The snapshot reader is process-lifetime state; the
+   * persisted identity on the run says which archive to re-capture, and the
+   * rebuilt reader keeps serving the current bytes under that identity.
+   * Failure is a diagnostic, never a startup blocker.
+   */
+  async restoreSourceSnapshots(): Promise<void> {
+    for (const run of this.#store.listRuns()) {
+      if (run.sourceSnapshot === null || run.sourceSnapshot.format !== "asar")
+        continue;
+      if (this.#sourceSnapshots.has(run.id)) continue;
+      const inputPath = run.input.input_path;
+      if (typeof inputPath !== "string") continue;
+      try {
+        const snapshot = await createRunSourceSnapshot(
+          inputPath,
+          this.#sourceLimits,
+        );
+        this.#sourceSnapshots.set(run.id, snapshot);
+      } catch (cause: unknown) {
+        this.#store.appendEvent({
+          runId: run.id,
+          type: "diagnostic.reported",
+          payload: {
+            kind: "source-snapshot",
+            message: `重启后快照重建失败: ${describeError(cause)}`,
+          },
+        });
+      }
+    }
+  }
+
   diagnostics(): WorkbenchManagerDiagnostics {
     const activeRun =
       this.#active === undefined

@@ -213,6 +213,7 @@ export const listenWorkbenchServer = async (
   const recovery = await handle.bundles.recoverOrphans();
   const runRecovery = recoverInterruptedRuns(handle.store);
   handle.manager.setStartupRecoveryReport(runRecovery);
+  await handle.manager.restoreSourceSnapshots();
   handle.completeStartup();
   return {
     orphanBundlesRemoved: recovery.removed.length,

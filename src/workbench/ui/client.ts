@@ -248,15 +248,24 @@ export const getDiff = (
   );
 
 export interface UiFileEntry {
+  readonly name: string;
   readonly path: string;
   readonly kind: string;
+  readonly extension?: string | null;
 }
 
 export const listFiles = (
   client: WorkbenchApiClient,
   runId: string,
+  prefix?: string,
 ): Promise<UiFileEntry[]> =>
-  client.get<UiFileEntry[]>(`/api/runs/${encodeURIComponent(runId)}/files`);
+  client.get<UiFileEntry[]>(
+    `/api/runs/${encodeURIComponent(runId)}/files${
+      prefix === undefined || prefix === ""
+        ? ""
+        : `?prefix=${encodeURIComponent(prefix)}`
+    }`,
+  );
 export const getSource = (
   client: WorkbenchApiClient,
   runId: string,

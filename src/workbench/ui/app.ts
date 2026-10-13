@@ -191,6 +191,7 @@ export class WorkbenchApp {
       nodeDetailId: null,
       diff: null,
       files: [],
+      filesPrefix: "",
       source: null,
       evidence: null,
       error: null,
@@ -341,7 +342,13 @@ export class WorkbenchApp {
           await this.#runDiffFromInput();
           return;
         case "load-files":
-          await this.#loadFiles();
+          await this.#loadFiles(this.#state.filesPrefix);
+          return;
+        case "open-files-prefix":
+          await this.#loadFiles(target.dataset.prefix ?? "");
+          return;
+        case "pick-source-file":
+          await this.#pickSourceFile(target.dataset.path ?? "");
           return;
         default:
           return;
@@ -585,11 +592,21 @@ export class WorkbenchApp {
     }
   }
 
-  async #loadFiles(): Promise<void> {
+  async #loadFiles(prefix?: string): Promise<void> {
     const run = this.#state.run;
     if (run === null) return;
-    const files = await api.listFiles(this.#client, run.id);
-    this.#patch({ files });
+    const files = await api.listFiles(this.#client, run.id, prefix);
+    this.#patch({ files, filesPrefix: prefix ?? "", error: null });
+  }
+
+  async #pickSourceFile(path: string): Promise<void> {
+    if (path === "") return;
+    const source = await api.getSource(
+      this.#client,
+      this.#state.run?.id ?? "",
+      path,
+    );
+    this.#patch({ source });
   }
 
   async #pickSource(path: string): Promise<void> {

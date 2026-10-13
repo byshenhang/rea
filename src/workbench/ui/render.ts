@@ -217,14 +217,33 @@ const sourceTab = (state: UiState): string => {
     run?.sourceSnapshot?.format === "asar"
       ? `读取自运行快照 <span class="pill">${esc(String(run.sourceSnapshot.sha256 ?? "").slice(0, 12))}</span>(目标文件后续变化不影响本运行内容)`
       : "读取自原始目标文件(只读,随目标变化)";
-  return `<div class="row"><select id="fileSelect" aria-label="选择源码文件" data-action="pick-source"><option value="">选择源码文件</option>${state.files
+  const directories = state.files
+    .filter((file) => file.kind === "directory")
+    .map(
+      (entry) =>
+        `<div class="node" tabindex="0" role="button" data-action="open-files-prefix" data-prefix="${esc(entry.path)}"><span class="node-kind">目录</span><span class="node-label">${esc(entry.name)}</span></div>`,
+    )
+    .join("");
+  const files = state.files
     .filter((file) => file.kind === "file")
     .map(
-      (file) => `<option value="${esc(file.path)}">${esc(file.path)}</option>`,
+      (file) =>
+        `<div class="node" tabindex="0" role="button" data-action="pick-source-file" data-path="${esc(file.path)}"><span class="node-kind">${esc(file.extension ?? "文件")}</span><span class="node-label">${esc(file.name ?? file.path)}</span></div>`,
     )
-    .join(
-      "",
-    )}</select><button class="ghost" data-action="load-files">刷新文件</button></div><p class="muted" style="font-size:11px">${snapshotNote}</p><pre class="code" data-testid="source-content">${esc(state.source?.content || "选择文件后查看;工作台只读显示源码。")}</pre>`;
+    .join("");
+  const prefix = state.filesPrefix;
+  const breadcrumb =
+    prefix === ""
+      ? "根目录"
+      : `<a href="#" data-action="open-files-prefix" data-prefix="">根目录</a> / ${prefix
+          .split("/")
+          .map((segment, index, all) =>
+            index === all.length - 1
+              ? `<strong>${esc(segment)}</strong>`
+              : `<a href="#" data-action="open-files-prefix" data-prefix="${esc(all.slice(0, index + 1).join("/"))}">${esc(segment)}</a>`,
+          )
+          .join(" / ")}`;
+  return `<div class="row"><span class="muted" style="font-size:12px">路径:</span><span style="font-size:12px" data-testid="files-breadcrumb">${breadcrumb}</span></div><div class="graph" style="height:auto;max-height:200px">${directories}${files || '<div class="empty">此目录没有文件</div>'}</div><p class="muted" style="font-size:11px">${snapshotNote}</p><pre class="code" style="min-height:220px" data-testid="source-content">${esc(state.source?.content || "点击文件名查看;工作台只读显示源码。")}</pre>`;
 };
 
 const evidenceTab = (state: UiState): string => {

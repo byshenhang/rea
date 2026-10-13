@@ -118,7 +118,14 @@ export interface UiState {
   readonly nodeDetailId: string | null;
   readonly diff: UiDiff | null;
   readonly diffLoading: boolean;
-  readonly files: readonly { readonly path: string; readonly kind: string }[];
+  readonly files: readonly {
+    readonly name: string;
+    readonly path: string;
+    readonly kind: string;
+    readonly extension?: string | null;
+  }[];
+  /** Directory currently expanded in the source tab ("" = root). */
+  readonly filesPrefix: string;
   readonly source: {
     readonly path: string;
     readonly content: string;
@@ -150,6 +157,7 @@ export const initialUiState = (): UiState => ({
   diff: null,
   diffLoading: false,
   files: [],
+  filesPrefix: "",
   source: null,
   evidence: null,
   evidenceLoading: false,
