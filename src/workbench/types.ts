@@ -47,6 +47,7 @@ export type WorkbenchCleanupStatus =
 export type WorkbenchEventType =
   | "run.created"
   | "run.started"
+  | "run.interrupted"
   | "step.started"
   | "step.progress"
   | "step.waiting"
@@ -140,7 +141,8 @@ export interface WorkbenchStepSnapshot {
     | "succeeded"
     | "failed"
     | "skipped"
-    | "cancelled";
+    | "cancelled"
+    | "interrupted";
   readonly startedAt: string | null;
   readonly finishedAt: string | null;
   readonly message: string | null;

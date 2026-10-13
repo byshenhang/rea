@@ -20,6 +20,8 @@ import {
   idempotencyKeyHeader,
   parseIdempotencyKey,
   parseJsonBody,
+  retryRequestDigest,
+  retryRunBodySchema,
   runRequestDigest,
   type WorkbenchComparisonResponse,
   type WorkbenchFileEntry,
@@ -40,6 +42,8 @@ import {
   type LoadedRunGraph,
 } from "./graphView.js";
 import { WorkbenchRunManager } from "./runManager.js";
+import { recoverInterruptedRuns } from "./recovery.js";
+import type { WorkbenchStartupRecoveryReport } from "./recovery.js";
 import {
   WorkbenchStore,
   defaultDatabasePath,
@@ -60,6 +64,8 @@ export interface WorkbenchServerOptions {
   readonly maxRunSourceBytes?: number;
   /** Filesystem root for evidence bundles; defaults beside the database. */
   readonly bundleRoot?: string;
+  /** Analysis deadline, including source snapshot preparation (default 30 minutes). */
+  readonly runTimeoutMs?: number;
 }
 
 export interface WorkbenchServerHandle {
@@ -70,6 +76,7 @@ export interface WorkbenchServerHandle {
   readonly host: string;
   readonly port: number;
   readonly token: string;
+  completeStartup(): void;
   close(): Promise<void>;
 }
 
@@ -77,6 +84,7 @@ export interface WorkbenchServerHandle {
 export const createWorkbenchServer = (
   options: WorkbenchServerOptions = {},
 ): WorkbenchServerHandle => {
+  let startupComplete = false;
   const host = options.host ?? DEFAULT_HOST;
   const port =
     options.port ?? parsePort(process.env.REA_WORKBENCH_PORT) ?? DEFAULT_PORT;
@@ -87,6 +95,9 @@ export const createWorkbenchServer = (
   );
   const manager = new WorkbenchRunManager(store, {
     bundles,
+    ...(options.runTimeoutMs === undefined
+      ? {}
+      : { runTimeoutMs: options.runTimeoutMs }),
     ...(options.maxRunSourceBytes === undefined
       ? {}
       : { sourceSnapshotLimits: { maxTotalBytes: options.maxRunSourceBytes } }),
@@ -96,6 +107,15 @@ export const createWorkbenchServer = (
     process.env.REA_WORKBENCH_TOKEN ??
     randomBytes(24).toString("hex");
   const server = createServer((request, response) => {
+    if (!startupComplete) {
+      sendJson(response, 503, {
+        error: {
+          code: "service_starting",
+          message: "工作台正在恢复本地运行状态，请稍后重试。",
+        },
+      });
+      return;
+    }
     void handleRequest(request, response, {
       host,
       port,
@@ -131,13 +151,21 @@ export const createWorkbenchServer = (
     host,
     port,
     token,
+    completeStartup: () => {
+      startupComplete = true;
+    },
     close: async () => {
-      await new Promise<void>((resolveClose, reject) =>
+      const closed = new Promise<void>((resolveClose, reject) =>
         server.close((error) =>
-          error === undefined ? resolveClose() : reject(error),
+          error === undefined ||
+          ("code" in error && error.code === "ERR_SERVER_NOT_RUNNING")
+            ? resolveClose()
+            : reject(error),
         ),
       );
-      await manager.dispose();
+      // Long-lived SSE clients must not prevent local worker shutdown.
+      server.closeAllConnections();
+      await Promise.all([closed, manager.dispose()]);
       store.close();
     },
   };
@@ -146,12 +174,12 @@ export const createWorkbenchServer = (
 export interface WorkbenchListenReport {
   readonly orphanBundlesRemoved: number;
   readonly orphanBundlesFailed: number;
+  readonly runRecovery: WorkbenchStartupRecoveryReport;
 }
 
 export const listenWorkbenchServer = async (
   handle: WorkbenchServerHandle,
 ): Promise<WorkbenchListenReport> => {
-  const recovery = await handle.bundles.recoverOrphans();
   await new Promise<void>((resolveListen, reject) => {
     const onError = (error: Error) => {
       handle.server.off("listening", onListening);
@@ -165,9 +193,16 @@ export const listenWorkbenchServer = async (
     handle.server.once("listening", onListening);
     handle.server.listen(handle.port, handle.host);
   });
+  // Acquire the port before changing durable state: a second start on the
+  // same listener must fail without interrupting the live instance's runs.
+  const recovery = await handle.bundles.recoverOrphans();
+  const runRecovery = recoverInterruptedRuns(handle.store);
+  handle.manager.setStartupRecoveryReport(runRecovery);
+  handle.completeStartup();
   return {
     orphanBundlesRemoved: recovery.removed.length,
     orphanBundlesFailed: recovery.failed.length,
+    runRecovery,
   };
 };
 
@@ -219,6 +254,12 @@ const handleRequest = async (
   }
   if (request.method === "GET" && url.pathname === "/api/workflows")
     return sendJson(response, 200, context.store.listWorkflows());
+  if (request.method === "GET" && url.pathname === "/api/diagnostics")
+    return sendJson(response, 200, {
+      ...context.manager.diagnostics(),
+      databasePath: context.store.databasePath,
+      bundleRoot: context.bundles.root,
+    });
   if (request.method === "GET" && url.pathname === "/api/providers")
     return sendJson(response, 200, [
       {
@@ -297,12 +338,6 @@ const handleRequest = async (
     const action = runMatch[2];
     if (request.method === "GET" && action === undefined)
       return getRun(response, context, runId);
-    if (
-      request.method === "POST" &&
-      action === undefined &&
-      url.pathname.endsWith("/cancel")
-    )
-      return cancelRun(response, context, runId);
     if (request.method === "GET" && action === "steps")
       return sendJson(response, 200, context.store.listSteps(runId));
     if (request.method === "GET" && action === "evidence")
@@ -318,6 +353,16 @@ const handleRequest = async (
   }
   if (request.method === "POST" && url.pathname === "/api/runs")
     return createRun(request, response, context);
+  if (
+    request.method === "POST" &&
+    /^\/api\/runs\/[^/]+\/retry$/u.test(url.pathname)
+  )
+    return retryRun(
+      request,
+      response,
+      context,
+      decodeURIComponent(url.pathname.split("/")[3] ?? ""),
+    );
   if (
     request.method === "POST" &&
     /^\/api\/runs\/[^/]+\/cancel$/u.test(url.pathname)
@@ -447,6 +492,33 @@ const getRun = (
       error: { code: "run_not_found", message: "运行不存在" },
     });
   else sendJson(response, 200, run);
+};
+
+const retryRun = async (
+  request: IncomingMessage,
+  response: ServerResponse,
+  context: RequestContext,
+  runId: string,
+): Promise<void> => {
+  await parseJsonBody(request, retryRunBodySchema);
+  const key = parseIdempotencyKey(request.headers[idempotencyKeyHeader]);
+  try {
+    const { run, replayed } = await context.manager.retryRun({
+      runId,
+      ...(key === null
+        ? {}
+        : { idempotency: { key, requestDigest: retryRequestDigest(runId) } }),
+    });
+    sendJson(
+      response,
+      202,
+      run,
+      replayed ? { "idempotency-replayed": "true" } : undefined,
+    );
+  } catch (cause: unknown) {
+    if (cause instanceof WorkbenchApiError) throw cause;
+    throw new WorkbenchApiError("run_rejected", describeError(cause));
+  }
 };
 
 const cancelRun = (
@@ -1292,16 +1364,16 @@ const esc=value=>String(value??'').replace(/[&<>'"]/g,c=>({'&':'&amp;','<':'&lt;
 const fmtTime=value=>value?new Date(value).toLocaleString():'—';
 const statusClass=s=>['succeeded','complete'].includes(s)?'ok':['failed','cancelled','interrupted'].includes(s)?'bad':['running','starting','cancelling','queued','finalizing'].includes(s)?'warn':'';
 const statusText=s=>({queued:'排队中',starting:'启动中',running:'运行中',finalizing:'收尾中',succeeded:'成功',failed:'失败',cancelling:'取消中',cancelled:'已取消',interrupted:'已中断',unknown:'未知'}[s]||s);
-const render=()=>{document.getElementById('app').innerHTML=\`<div class="shell"><aside class="sidebar"><div class="brand">REA Workbench</div><div class="muted">本地分析与流程调试台</div><div class="section"><h3>项目</h3><div class="stack">\${state.projects.map(p=>\`<div class="project \${state.project?.id===p.id?'active':''}" onclick="selectProject('\${p.id}')"><div>\${esc(p.name)}</div><small class="muted">\${esc(p.description||'未填写说明')}</small></div>\`).join('')||'<div class="empty">还没有项目</div>'}</div><div class="form-actions"><button class="ghost" onclick="newProject()">+ 新建项目</button></div></div>\${state.project?'<div class="section"><h3>目标</h3><div class="stack">'+(state.targets.map(t=>\`<div class="target" onclick="selectTarget('\${t.id}')"><div>\${esc(t.path.split('/').pop()||t.path)}</div><small class="muted">\${esc(t.path)}</small></div>\`).join('')||'<div class="empty">登记目录或 ASAR</div>')+'</div><div class="form-actions"><button class="ghost" onclick="newTarget()">+ 登记目标</button></div></div>':''}<div class="section"><h3>最近运行</h3><div class="stack">\${state.runs.slice(0,8).map(r=>\`<div class="run" onclick="selectRun('\${r.id}')"><div class="row"><span class="pill \${statusClass(r.state)}">\${statusText(r.state)}</span><span class="muted">\${fmtTime(r.createdAt)}</span></div><small class="muted">\${esc(r.id.slice(0,8))} · \${esc(r.resultCompleteness)}</small></div>\`).join('')||'<div class="empty">暂无运行</div>'}</div></div></aside><main class="main"><header class="topbar"><div><h1>\${esc(state.run?'运行工作台':'项目首页')}</h1><div class="muted">\${esc(state.project?.name||'选择一个项目开始')}</div></div><div class="row">\${state.run?\`<span class="pill \${statusClass(state.run.state)}">\${statusText(state.run.state)}</span>\${['queued','starting','running','cancelling'].includes(state.run.state)?'<button onclick="cancelRun()">取消运行</button>':''}<button class="ghost" onclick="downloadEvidence()">导出</button><button class="ghost" onclick="compareCurrentRun()">比较</button>\` : ''}<button class="ghost" onclick="refresh()">刷新</button></div></header><section class="content">\${state.run?runView():homeView()}</section></main></div>\`};
+const render=()=>{document.getElementById('app').innerHTML=\`<div class="shell"><aside class="sidebar"><div class="brand">REA Workbench</div><div class="muted">本地分析与流程调试台</div><div class="section"><h3>项目</h3><div class="stack">\${state.projects.map(p=>\`<div class="project \${state.project?.id===p.id?'active':''}" onclick="selectProject('\${p.id}')"><div>\${esc(p.name)}</div><small class="muted">\${esc(p.description||'未填写说明')}</small></div>\`).join('')||'<div class="empty">还没有项目</div>'}</div><div class="form-actions"><button class="ghost" onclick="newProject()">+ 新建项目</button></div></div>\${state.project?'<div class="section"><h3>目标</h3><div class="stack">'+(state.targets.map(t=>\`<div class="target" onclick="selectTarget('\${t.id}')"><div>\${esc(t.path.split('/').pop()||t.path)}</div><small class="muted">\${esc(t.path)}</small></div>\`).join('')||'<div class="empty">登记目录或 ASAR</div>')+'</div><div class="form-actions"><button class="ghost" onclick="newTarget()">+ 登记目标</button></div></div>':''}<div class="section"><h3>最近运行</h3><div class="stack">\${state.runs.slice(0,8).map(r=>\`<div class="run" onclick="selectRun('\${r.id}')"><div class="row"><span class="pill \${statusClass(r.state)}">\${statusText(r.state)}</span><span class="muted">\${fmtTime(r.createdAt)}</span></div><small class="muted">\${esc(r.id.slice(0,8))} · \${esc(r.resultCompleteness)}</small></div>\`).join('')||'<div class="empty">暂无运行</div>'}</div></div></aside><main class="main"><header class="topbar"><div><h1>\${esc(state.run?'运行工作台':'项目首页')}</h1><div class="muted">\${esc(state.project?.name||'选择一个项目开始')}</div></div><div class="row">\${state.run?\`<span class="pill \${statusClass(state.run.state)}">\${statusText(state.run.state)}</span>\${['queued','starting','running','cancelling'].includes(state.run.state)?'<button onclick="cancelRun()">取消运行</button>':''}\${['failed','cancelled','interrupted'].includes(state.run.state)?'<button onclick="retryCurrentRun()">重试运行</button>':''}<button class="ghost" onclick="downloadEvidence()">导出</button><button class="ghost" onclick="compareCurrentRun()">比较</button>\` : ''}<button class="ghost" onclick="refresh()">刷新</button></div></header><section class="content">\${state.run?runView():homeView()}</section></main></div>\`};
 const homeView=()=>{const r=state.runs[0];return \`<div class="cards"><div class="card"><div class="label">目标</div><div class="value">\${state.targets.length}</div></div><div class="card"><div class="label">运行</div><div class="value">\${state.runs.length}</div></div><div class="card"><div class="label">成功</div><div class="value">\${state.runs.filter(x=>x.state==='succeeded').length}</div></div><div class="card"><div class="label">Provider</div><div class="value" style="font-size:15px">REA JS</div></div></div><div class="panel" style="margin-top:14px"><h2>开始一次分析</h2><div class="panel-body"><p class="muted">首期工作台复用 REA 的 JavaScript/Electron 静态分析工作流，不执行目标代码。</p>\${state.project?'<button onclick="newRun()">新建运行</button>':'<button onclick="newProject()">先创建项目</button>'}</div></div>\${r?'<div class="panel" style="margin-top:14px"><h2>最近运行</h2><div class="panel-body"><button onclick="selectRun(\\''+r.id+'\\')">打开最近运行</button></div></div>':''}\`};
-const runView=()=>{const summary=state.run.resultSummary||{},stats=summary.statistics||{};return \`<div class="cards"><div class="card"><div class="label">状态</div><div class="value"><span class="pill \${statusClass(state.run.state)}">\${statusText(state.run.state)}</span></div></div><div class="card"><div class="label">源码文件</div><div class="value">\${stats.parsed_javascript_files??'—'}</div></div><div class="card"><div class="label">模块</div><div class="value">\${stats.modules??'—'}</div></div><div class="card"><div class="label">Evidence</div><div class="value" style="font-size:12px;word-break:break-all">\${esc(state.run.evidenceId||'尚未生成')}</div></div></div><div class="tabs"><button class="\${state.tab==='timeline'?'active':''}" onclick="setTab('timeline')">执行时间线</button><button class="\${state.tab==='graph'?'active':''}" onclick="setTab('graph')">结果图</button><button class="\${state.tab==='source'?'active':''}" onclick="setTab('source')">源码</button><button class="\${state.tab==='evidence'?'active':''}" onclick="setTab('evidence')">Evidence</button><button class="\${state.tab==='diff'?'active':''}" onclick="setTab('diff')">差异</button></div><div class="workspace"><div class="panel"><h2>步骤</h2><div class="steps">\${state.steps.map(s=>\`<div class="step \${s.state}"><span class="dot"></span><div><div class="name">\${esc(s.name)}</div><div class="message">\${esc(s.message||statusText(s.state))}</div></div></div>\`).join('')||'<div class="empty">等待事件</div>'}</div></div><div class="panel"><h2>\${state.tab==='timeline'?'执行时间线':state.tab==='graph'?'关系图':state.tab==='diff'?'运行差异':state.tab==='source'?'源码查看':'Evidence 详情'}</h2><div class="panel-body"><div class="tab \${state.tab==='timeline'?'active':''}"><div class="timeline">\${state.events.slice().reverse().map(e=>\`<div class="event"><strong>\${esc(e.type)}</strong> <span class="muted">#\${e.sequence} · \${fmtTime(e.timestamp)}</span><div>\${esc(e.payload?.message||e.payload?.phase||e.payload?.state||'')}</div></div>\`).join('')||'<div class="empty">还没有事件</div>'}</div></div><div class="tab \${state.tab==='graph'?'active':''}"><div class="row"><input id="graphSearch" placeholder="搜索节点（标签或 ID）" value="\${esc(state.graphFilter.search)}" onchange="applyGraphFilter()"><select id="graphKind" onchange="applyGraphFilter()"><option value="">全部类型</option>\${graphKindOptions()}</select><button class="ghost" onclick="applyGraphFilter()">筛选</button></div><div class="graph">\${graphNodesHtml()}</div></div><div class="tab \${state.tab==='diff'?'active':''}"><div class="row"><input id="diffAgainst" placeholder="对比的运行 ID" style="flex:1"><button onclick="runDiffFromInput()">比较</button></div><div class="graph">\${diffHtml()}</div></div><div class="tab \${state.tab==='source'?'active':''}"><div class="row"><select id="fileSelect" onchange="loadSource(this.value)"><option value="">选择源码文件</option>\${state.files.filter(f=>f.kind==='file').map(f=>\`<option value="\${esc(f.path)}">\${esc(f.path)}</option>\`).join('')}</select><button class="ghost" onclick="loadFiles()">刷新文件</button></div><p class="muted" style="font-size:11px">\${state.run.sourceSnapshot?.format==='asar'?\`读取自运行快照 <span class="pill">\${esc(String(state.run.sourceSnapshot.sha256).slice(0,12))}</span>（目标文件后续变化不影响本运行内容）\`:'读取自原始目标文件（只读，随目标变化）'}</p><pre class="code" id="sourceCode">\${esc(state.source?.content||'选择文件后查看；工作台只读显示源码。')}</pre></div><div class="tab \${state.tab==='evidence'?'active':''}"><pre class="code">\${esc(state.evidence?JSON.stringify(state.evidence,null,2):'切换到此页后加载 Evidence')}</pre></div></div></div><aside class="panel"><h2>上下文</h2><div class="panel-body"><p><span class="muted">目标</span><br>\${esc(state.target?.path||'—')}</p><p><span class="muted">流程</span><br>\${esc(state.run.workflowId)} @ \${esc(state.run.workflowVersion)}</p><p><span class="muted">开始</span><br>\${fmtTime(state.run.startedAt)}</p><p><span class="muted">结束</span><br>\${fmtTime(state.run.finishedAt)}</p><p><span class="muted">结果完整性</span><br><span class="pill \${statusClass(state.run.resultCompleteness)}">\${esc(state.run.resultCompleteness)}</span></p><p><span class="muted">清理</span><br>\${esc(state.run.cleanupStatus)}</p>\${state.run.error?'<p style="color:var(--bad)">'+esc(state.run.error.message)+'</p>':''}</div></aside></div>\`};
+const runView=()=>{const summary=state.run.resultSummary||{},stats=summary.statistics||{};return \`<div class="cards"><div class="card"><div class="label">状态</div><div class="value"><span class="pill \${statusClass(state.run.state)}">\${statusText(state.run.state)}</span></div></div><div class="card"><div class="label">源码文件</div><div class="value">\${stats.parsed_javascript_files??'—'}</div></div><div class="card"><div class="label">模块</div><div class="value">\${stats.modules??'—'}</div></div><div class="card"><div class="label">Evidence</div><div class="value" style="font-size:12px;word-break:break-all">\${esc(state.run.evidenceId||'尚未生成')}</div></div></div><div class="tabs"><button class="\${state.tab==='timeline'?'active':''}" onclick="setTab('timeline')">执行时间线</button><button class="\${state.tab==='graph'?'active':''}" onclick="setTab('graph')">结果图</button><button class="\${state.tab==='source'?'active':''}" onclick="setTab('source')">源码</button><button class="\${state.tab==='evidence'?'active':''}" onclick="setTab('evidence')">Evidence</button><button class="\${state.tab==='diff'?'active':''}" onclick="setTab('diff')">差异</button></div><div class="workspace"><div class="panel"><h2>步骤</h2><div class="steps">\${state.steps.map(s=>\`<div class="step \${s.state}"><span class="dot"></span><div><div class="name">\${esc(s.name)}</div><div class="message">\${esc(s.message||statusText(s.state))}</div></div></div>\`).join('')||'<div class="empty">等待事件</div>'}</div></div><div class="panel"><h2>\${state.tab==='timeline'?'执行时间线':state.tab==='graph'?'关系图':state.tab==='diff'?'运行差异':state.tab==='source'?'源码查看':'Evidence 详情'}</h2><div class="panel-body"><div class="tab \${state.tab==='timeline'?'active':''}"><div class="timeline">\${state.events.slice().reverse().map(e=>\`<div class="event"><strong>\${esc(e.type)}</strong> <span class="muted">#\${e.sequence} · \${fmtTime(e.timestamp)}</span><div>\${esc(e.payload?.message||e.payload?.phase||e.payload?.state||'')}</div></div>\`).join('')||'<div class="empty">还没有事件</div>'}</div></div><div class="tab \${state.tab==='graph'?'active':''}"><div class="row"><input id="graphSearch" placeholder="搜索节点（标签或 ID）" value="\${esc(state.graphFilter.search)}" onchange="applyGraphFilter()"><select id="graphKind" onchange="applyGraphFilter()"><option value="">全部类型</option>\${graphKindOptions()}</select><button class="ghost" onclick="applyGraphFilter()">筛选</button></div><div class="graph">\${graphNodesHtml()}</div></div><div class="tab \${state.tab==='diff'?'active':''}"><div class="row"><input id="diffAgainst" placeholder="对比的运行 ID" style="flex:1"><button onclick="runDiffFromInput()">比较</button></div><div class="graph">\${diffHtml()}</div></div><div class="tab \${state.tab==='source'?'active':''}"><div class="row"><select id="fileSelect" onchange="loadSource(this.value)"><option value="">选择源码文件</option>\${state.files.filter(f=>f.kind==='file').map(f=>\`<option value="\${esc(f.path)}">\${esc(f.path)}</option>\`).join('')}</select><button class="ghost" onclick="loadFiles()">刷新文件</button></div><p class="muted" style="font-size:11px">\${state.run.sourceSnapshot?.format==='asar'?\`读取自运行快照 <span class="pill">\${esc(String(state.run.sourceSnapshot.sha256).slice(0,12))}</span>（目标文件后续变化不影响本运行内容）\`:'读取自原始目标文件（只读，随目标变化）'}</p><pre class="code" id="sourceCode">\${esc(state.source?.content||'选择文件后查看；工作台只读显示源码。')}</pre></div><div class="tab \${state.tab==='evidence'?'active':''}"><pre class="code">\${esc(state.evidence?JSON.stringify(state.evidence,null,2):'切换到此页后加载 Evidence')}</pre></div></div></div><aside class="panel"><h2>上下文</h2><div class="panel-body"><p><span class="muted">目标</span><br>\${esc(state.target?.path||'—')}</p><p><span class="muted">流程</span><br>\${esc(state.run.workflowId)} @ \${esc(state.run.workflowVersion)}</p><p><span class="muted">开始</span><br>\${fmtTime(state.run.startedAt)}</p><p><span class="muted">结束</span><br>\${fmtTime(state.run.finishedAt)}</p><p><span class="muted">结果完整性</span><br><span class="pill \${statusClass(state.run.resultCompleteness)}">\${esc(state.run.resultCompleteness)}</span></p><p><span class="muted">清理</span><br>\${esc(state.run.cleanupStatus)}</p>\${state.run.error?'<p style="color:var(--bad)">'+esc(state.run.error.code)+': '+esc(state.run.error.message)+'</p>':''}</div></aside></div>\`};
 async function refresh(){try{state.projects=await api('/api/projects');if(state.project)state.project=state.projects.find(p=>p.id===state.project.id)||state.projects[0]||null;else state.project=state.projects[0]||null;if(state.project)state.targets=await api('/api/projects/'+state.project.id+'/targets');state.runs=await api('/api/runs'+(state.project?'?project_id='+encodeURIComponent(state.project.id):''));if(state.run){state.run=await api('/api/runs/'+state.run.id);state.steps=await api('/api/runs/'+state.run.id+'/steps')}render()}catch(e){alert(e.message)}}
 async function selectProject(id){state.project=state.projects.find(p=>p.id===id)||null;state.run=null;state.target=null;await refresh()}
 async function selectTarget(id){state.target=state.targets.find(t=>t.id===id)||null;render()}
 async function selectRun(id){state.run=await api('/api/runs/'+id);state.project=state.projects.find(p=>p.id===state.run.projectId)||null;state.targets=state.project?await api('/api/projects/'+state.project.id+'/targets'):[];state.target=state.targets.find(t=>t.id===state.run.targetId)||null;state.steps=await api('/api/runs/'+id+'/steps');state.events=await api('/api/runs/'+id+'/events?format=json&after=0').catch(()=>[]);subscribe();render()}
 function setTab(tab){state.tab=tab;render();if(tab==='graph'&&!state.graphNodes.length)loadGraphNodes(true);if(tab==='evidence'&&!state.evidence)loadEvidence();if(tab==='source'&&!state.files.length)loadFiles()}
 function graphKindOptions(){const kinds=[...new Set(state.graphNodes.map(n=>n.kind))];if(state.graphFilter.kind&&!kinds.includes(state.graphFilter.kind))kinds.push(state.graphFilter.kind);return kinds.map(k=>'<option value="'+esc(k)+'"'+(state.graphFilter.kind===k?' selected':'')+'>'+esc(k)+'</option>').join('')}
-function graphNodesHtml(){if(!state.graphNodes.length)return '<div class="empty">没有匹配的节点</div>';const rows=state.graphNodes.map(n=>'<div class="node" onclick="openNode(''+esc(n.node_id)+'')"><span class="node-kind">'+esc(n.kind)+'</span><span class="node-label">'+esc(n.label||n.node_id)+'</span></div>').join('');const more=state.graphCursor?'<div style="padding:8px;text-align:center"><button class="ghost" onclick="loadMoreGraph()">加载更多（已 '+state.graphNodes.length+'/'+state.graphTotal+'）</button></div>':'<div class="empty" style="font-size:11px">共 '+state.graphTotal+' 个节点</div>';const detail=state.nodeDetail?nodeDetailHtml():'';return rows+more+detail}
+function graphNodesHtml(){if(!state.graphNodes.length)return '<div class="empty">没有匹配的节点</div>';const rows=state.graphNodes.map(n=>'<div class="node" data-node-id="'+esc(n.node_id)+'" onclick="openNode(this.dataset.nodeId)"><span class="node-kind">'+esc(n.kind)+'</span><span class="node-label">'+esc(n.label||n.node_id)+'</span></div>').join('');const more=state.graphCursor?'<div style="padding:8px;text-align:center"><button class="ghost" onclick="loadMoreGraph()">加载更多（已 '+state.graphNodes.length+'/'+state.graphTotal+'）</button></div>':'<div class="empty" style="font-size:11px">共 '+state.graphTotal+' 个节点</div>';const detail=state.nodeDetail?nodeDetailHtml():'';return rows+more+detail}
 function nodeDetailHtml(){const d=state.nodeDetail;const locs=(d.node&&d.node.locations||[]).map(l=>esc(typeof l==='string'?l:(l.path||JSON.stringify(l)))).join('<br>');return '<div style="border-top:1px solid var(--line);padding:10px"><div><strong>'+esc((d.node&&d.node.label)||state.nodeDetailId||'')+'</strong> <span class="pill">'+esc((d.node&&d.node.kind)||'')+'</span></div><div class="muted" style="font-size:11px">入边 '+d.in_degree+' · 出边 '+d.out_degree+' · 图 '+esc(String(d.graph_id||'').slice(0,12))+'</div><div class="muted" style="font-size:11px;word-break:break-all">'+(locs||'无源码位置')+'</div><div style="margin-top:6px"><button class="ghost" onclick="expandNeighbors()">展开邻居</button> <button class="ghost" onclick="state.nodeDetail=null;render()">关闭</button></div></div>'}
 async function loadGraphNodes(reset){try{if(reset){state.graphNodes=[];state.graphCursor=null}const params=new URLSearchParams({limit:'100'});if(state.graphFilter.search)params.set('search',state.graphFilter.search);if(state.graphFilter.kind)params.set('kind',state.graphFilter.kind);if(!reset&&state.graphCursor)params.set('cursor',state.graphCursor);const pageData=await api('/api/runs/'+state.run.id+'/graph/nodes?'+params.toString());const seen=new Set(state.graphNodes.map(n=>n.node_id));for(const n of pageData.nodes)if(!seen.has(n.node_id)){state.graphNodes.push(n);seen.add(n.node_id)}state.graphCursor=pageData.cursor;state.graphTotal=pageData.total;render()}catch(e){alert(e.message)}}
 async function loadMoreGraph(){await loadGraphNodes(false)}
@@ -1315,8 +1387,9 @@ async function downloadEvidence(){if(!state.run)return;try{const res=await fetch
 async function compareCurrentRun(){state.tab='diff';render();setTimeout(()=>{const input=document.getElementById('diffAgainst');if(input)input.focus()},0)}
 async function loadFiles(){try{state.files=await api('/api/runs/'+state.run.id+'/files');render()}catch(e){alert(e.message)}}
 async function loadSource(path){if(!path)return;try{state.source=await api('/api/runs/'+state.run.id+'/source?path='+encodeURIComponent(path));render()}catch(e){alert(e.message)}}
-function subscribe(){if(state.eventSource)state.eventSource.close();if(!state.run)return;state.eventSource=new EventSource('/api/runs/'+state.run.id+'/events?token='+encodeURIComponent(token)+'&after='+(state.events.at(-1)?.sequence||0));state.eventSource.addEventListener('step.progress',onEvent);state.eventSource.addEventListener('step.started',onEvent);state.eventSource.addEventListener('step.finished',onEvent);state.eventSource.addEventListener('run.finished',onEvent);state.eventSource.addEventListener('diagnostic.reported',onEvent);state.eventSource.addEventListener('evidence.recorded',onEvent)}
+function subscribe(){if(state.eventSource)state.eventSource.close();if(!state.run)return;state.eventSource=new EventSource('/api/runs/'+state.run.id+'/events?token='+encodeURIComponent(token)+'&after='+(state.events.at(-1)?.sequence||0));state.eventSource.addEventListener('step.progress',onEvent);state.eventSource.addEventListener('step.started',onEvent);state.eventSource.addEventListener('step.finished',onEvent);state.eventSource.addEventListener('run.finished',onEvent);state.eventSource.addEventListener('diagnostic.reported',onEvent);state.eventSource.addEventListener('evidence.recorded',onEvent);state.eventSource.addEventListener('run.interrupted',onEvent)}
 async function onEvent(event){const item=JSON.parse(event.data);if(!state.events.some(e=>e.sequence===item.sequence))state.events.push(item);state.steps=await api('/api/runs/'+state.run.id+'/steps');state.run=await api('/api/runs/'+state.run.id);render();if(['succeeded','failed','cancelled','interrupted'].includes(state.run.state))state.eventSource?.close()}
+async function retryCurrentRun(){if(!state.run)return;try{const key=crypto.randomUUID();const run=await api('/api/runs/'+state.run.id+'/retry',{method:'POST',headers:{'Idempotency-Key':key},body:'{}'});await selectRun(run.id)}catch(e){alert(e.message)}}
 async function cancelRun(){if(state.run)try{state.run=await api('/api/runs/'+state.run.id+'/cancel',{method:'POST',body:'{}'});render()}catch(e){alert(e.message)}}
 function newProject(){const name=prompt('项目名称');if(!name)return;const description=prompt('项目说明')||'';api('/api/projects',{method:'POST',body:JSON.stringify({name,description})}).then(refresh).catch(e=>alert(e.message))}
 function newTarget(){if(!state.project)return;const path=prompt('目标绝对路径（目录或 ASAR）');if(!path)return;api('/api/projects/'+state.project.id+'/targets',{method:'POST',body:JSON.stringify({path,format:path.toLowerCase().endsWith('.asar')?'asar':'auto'})}).then(refresh).catch(e=>alert(e.message))}

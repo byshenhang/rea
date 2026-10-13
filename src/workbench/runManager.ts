@@ -6,7 +6,8 @@ import { createProgressReporter } from "../application/ProgressReporter.js";
 import { analyzeJavaScriptApplication } from "../application/javascript/JavaScriptApplicationService.js";
 import type { JsonValue } from "../domain/jsonValue.js";
 import type { Evidence } from "../domain/evidence.js";
-import { WorkbenchIdempotencyConflictError } from "./api.js";
+import { err, type Result } from "../domain/result.js";
+import { WorkbenchApiError, WorkbenchIdempotencyConflictError } from "./api.js";
 import { WorkbenchBundleStore, defaultBundleRoot } from "./bundleStore.js";
 import { WorkbenchStore } from "./store.js";
 import {
@@ -21,10 +22,24 @@ import type {
   WorkbenchRunState,
   WorkflowDefinition,
 } from "./types.js";
+import type { WorkbenchStartupRecoveryReport } from "./recovery.js";
 
 interface QueuedRun {
   readonly runId: string;
   readonly controller: AbortController;
+  abortReason: "user_cancelled" | "analysis_timeout" | null;
+}
+
+export interface WorkbenchManagerDiagnostics {
+  readonly queueLength: number;
+  readonly queuedRunIds: readonly string[];
+  readonly active: {
+    readonly runId: string;
+    readonly step: string | null;
+    readonly startedAt: string | null;
+  } | null;
+  readonly lastStartupRecovery: WorkbenchStartupRecoveryReport | null;
+  readonly runTimeoutMs: number;
 }
 
 const PHASE_STEP: Readonly<Record<string, string>> = {
@@ -48,16 +63,22 @@ export class WorkbenchRunManager {
   readonly #queue: QueuedRun[] = [];
   readonly #sourceLimits: SourceSnapshotLimits;
   readonly #bundles: WorkbenchBundleStore;
+  readonly #runTimeoutMs: number;
   readonly #sourceSnapshots = new Map<string, RunAsarSourceSnapshot>();
   readonly #sourceLimitNoted = new Set<string>();
   #active: QueuedRun | undefined;
   #activeStep: string | undefined;
+  #activeExecution: Promise<void> | undefined;
+  #stopping = false;
+  readonly #failedCleanup = new Set<ArtifactResourceScope>();
+  #lastStartupRecovery: WorkbenchStartupRecoveryReport | null = null;
 
   constructor(
     store: WorkbenchStore,
     options: {
       readonly sourceSnapshotLimits?: Partial<SourceSnapshotLimits>;
       readonly bundles?: WorkbenchBundleStore;
+      readonly runTimeoutMs?: number;
     } = {},
   ) {
     this.#store = store;
@@ -68,6 +89,36 @@ export class WorkbenchRunManager {
     this.#bundles =
       options.bundles ??
       new WorkbenchBundleStore(defaultBundleRoot(store.databasePath));
+    this.#runTimeoutMs = parseRunTimeout(
+      options.runTimeoutMs === undefined
+        ? process.env.REA_WORKBENCH_RUN_TIMEOUT_MS
+        : String(options.runTimeoutMs),
+    );
+  }
+
+  setStartupRecoveryReport(report: WorkbenchStartupRecoveryReport): void {
+    this.#lastStartupRecovery = report;
+  }
+
+  diagnostics(): WorkbenchManagerDiagnostics {
+    const activeRun =
+      this.#active === undefined
+        ? null
+        : this.#store.getRun(this.#active.runId);
+    return {
+      queueLength: this.#queue.length,
+      queuedRunIds: this.#queue.map((entry) => entry.runId),
+      active:
+        this.#active === undefined
+          ? null
+          : {
+              runId: this.#active.runId,
+              step: this.#activeStep ?? null,
+              startedAt: activeRun?.startedAt ?? null,
+            },
+      lastStartupRecovery: this.#lastStartupRecovery,
+      runTimeoutMs: this.#runTimeoutMs,
+    };
   }
 
   /** Snapshot bound to a finished or running run, for tree and text reads. */
@@ -88,14 +139,17 @@ export class WorkbenchRunManager {
 
   /** Release every run-scoped source snapshot (private ASAR copies). */
   async dispose(): Promise<void> {
-    const snapshots = [...this.#sourceSnapshots.values()];
-    this.#sourceSnapshots.clear();
-    for (const snapshot of snapshots) {
-      try {
-        await snapshot.close();
-      } catch {
-        // A leaked snapshot directory is diagnosable on disk; closing must not mask other cleanup.
-      }
+    this.#stopping = true;
+    for (const entry of [...this.#queue]) this.cancelRun(entry.runId);
+    if (this.#active !== undefined) this.cancelRun(this.#active.runId);
+    await this.#activeExecution;
+    for (const scope of this.#failedCleanup) {
+      await scope.close();
+      this.#failedCleanup.delete(scope);
+    }
+    for (const [runId, snapshot] of this.#sourceSnapshots) {
+      await snapshot.close();
+      this.#sourceSnapshots.delete(runId);
     }
   }
 
@@ -104,11 +158,18 @@ export class WorkbenchRunManager {
     readonly targetId: string;
     readonly workflow: WorkflowDefinition;
     readonly parameters: Record<string, JsonValue>;
+    readonly retryOfRunId?: string;
     readonly idempotency?: {
       readonly key: string;
       readonly requestDigest: string;
     };
   }): Promise<{ readonly run: WorkbenchRun; readonly replayed: boolean }> {
+    if (this.#stopping)
+      throw new WorkbenchApiError("run_rejected", "工作台正在关闭。");
+    if (input.idempotency !== undefined) {
+      const replayed = this.#replayByIdempotencyKey(input.idempotency);
+      if (replayed !== null) return { run: replayed, replayed: true };
+    }
     const target = this.#store.getTarget(input.targetId);
     if (target === null || target.projectId !== input.projectId)
       throw new Error("目标不存在或不属于当前项目");
@@ -154,12 +215,55 @@ export class WorkbenchRunManager {
         workflow_id: run.workflowId,
         workflow_version: run.workflowVersion,
         target_id: run.targetId,
+        ...(input.retryOfRunId === undefined
+          ? {}
+          : { retry_of_run_id: input.retryOfRunId }),
       },
     });
     const controller = new AbortController();
-    this.#queue.push({ runId: run.id, controller });
+    this.#queue.push({ runId: run.id, controller, abortReason: null });
     this.#pump();
     return { run, replayed: false };
+  }
+
+  async retryRun(input: {
+    readonly runId: string;
+    readonly idempotency?: {
+      readonly key: string;
+      readonly requestDigest: string;
+    };
+  }): Promise<{ readonly run: WorkbenchRun; readonly replayed: boolean }> {
+    const previous = this.#store.getRun(input.runId);
+    if (previous === null)
+      throw new WorkbenchApiError("run_not_found", "运行不存在");
+    if (!["failed", "cancelled", "interrupted"].includes(previous.state))
+      throw new WorkbenchApiError(
+        "retry_not_allowed",
+        previous.state === "succeeded"
+          ? "成功运行不允许重试；请创建新的运行以明确重复分析意图。"
+          : "运行尚未进入可重试的终态。",
+      );
+    const workflow = this.#store.getWorkflow(
+      previous.workflowId,
+      previous.workflowVersion,
+    );
+    if (workflow === null || workflow.capabilities.retry !== true)
+      throw new WorkbenchApiError(
+        "retry_not_allowed",
+        "当前流程版本未声明支持安全重试。",
+      );
+    const parameters = { ...previous.input };
+    delete parameters.input_path;
+    return this.createRun({
+      projectId: previous.projectId,
+      targetId: previous.targetId,
+      workflow,
+      parameters,
+      retryOfRunId: previous.id,
+      ...(input.idempotency === undefined
+        ? {}
+        : { idempotency: input.idempotency }),
+    });
   }
 
   #replayByIdempotencyKey(idempotency: {
@@ -182,10 +286,16 @@ export class WorkbenchRunManager {
     const current = this.#store.getRun(runId);
     if (current === null) throw new Error("运行不存在");
     if (
-      ["succeeded", "failed", "cancelled", "interrupted"].includes(
-        current.state,
-      )
+      [
+        "succeeded",
+        "failed",
+        "cancelled",
+        "interrupted",
+        "finalizing",
+      ].includes(current.state)
     )
+      return current;
+    if (this.#active?.runId === runId && this.#active.abortReason !== null)
       return current;
     this.#store.appendEvent({
       runId,
@@ -195,21 +305,36 @@ export class WorkbenchRunManager {
     const queued = this.#queue.find((entry) => entry.runId === runId);
     if (queued !== undefined && this.#active?.runId !== runId) {
       queued.controller.abort();
+      queued.abortReason = "user_cancelled";
       this.#queue.splice(this.#queue.indexOf(queued), 1);
       const cancelled = this.#store.updateRun(runId, {
         state: "cancelled",
         resultCompleteness: "none",
         cleanupStatus: "not-required",
         finishedAt: new Date().toISOString(),
+        error: {
+          code: "user_cancelled",
+          message: "用户请求取消运行。",
+        },
+      });
+      this.#store.appendEvent({
+        runId,
+        type: "diagnostic.reported",
+        payload: cancelled.error ?? { code: "user_cancelled" },
       });
       this.#store.appendEvent({
         runId,
         type: "run.finished",
-        payload: { state: "cancelled", result_completeness: "none" },
+        payload: {
+          state: "cancelled",
+          result_completeness: "none",
+          cause: "user-cancelled",
+        },
       });
       return cancelled;
     }
     if (this.#active?.runId === runId) {
+      this.#active.abortReason = "user_cancelled";
       this.#store.updateRun(runId, { state: "cancelling" });
       this.#active.controller.abort();
     }
@@ -217,14 +342,18 @@ export class WorkbenchRunManager {
   }
 
   #pump(): void {
-    if (this.#active !== undefined) return;
+    if (this.#active !== undefined || this.#stopping) return;
     const next = this.#queue.shift();
     if (next === undefined) return;
     this.#active = next;
-    void this.#execute(next).finally(() => {
+    this.#activeExecution = this.#execute(next).finally(() => {
       this.#active = undefined;
       this.#activeStep = undefined;
       this.#pump();
+    });
+    void this.#activeExecution.catch(() => {
+      // Keep the durable nonterminal state for startup recovery if persistence
+      // itself fails. Disposal still observes the execution rejection.
     });
   }
 
@@ -253,13 +382,28 @@ export class WorkbenchRunManager {
       "succeeded",
       "目标路径已授权并可读",
     );
-    await this.#captureSourceSnapshot(run.id, String(run.input.input_path));
     const resources = new ArtifactResourceScope();
-    let result: Awaited<ReturnType<typeof analyzeJavaScriptApplication>>;
+    let result: Result<Evidence, unknown>;
+    const deadline = Date.now() + this.#runTimeoutMs;
+    let timeoutHandle: ReturnType<typeof setTimeout> | undefined;
+    let signalTimeout: (() => void) | undefined;
+    const timeoutPromise = new Promise<void>((resolveTimeout) => {
+      signalTimeout = resolveTimeout;
+    });
+    const checkDeadline = (): void => {
+      if (entry.abortReason !== null || Date.now() < deadline) return;
+      entry.abortReason = "analysis_timeout";
+      entry.controller.abort(new Error("Workbench analysis timeout"));
+      signalTimeout?.();
+    };
+    timeoutHandle = setTimeout(checkDeadline, this.#runTimeoutMs);
     try {
+      await this.#captureSourceSnapshot(run.id, String(run.input.input_path));
+      checkDeadline();
       this.#store.updateRun(run.id, { state: "running" });
       const progress = createProgressReporter(
         async (update) => {
+          checkDeadline();
           const step =
             PHASE_STEP[update.phase] ?? this.#activeStep ?? "inventory";
           if (this.#activeStep !== step) {
@@ -282,7 +426,7 @@ export class WorkbenchRunManager {
         },
         { minimumIntervalMs: 50 },
       );
-      result = await analyzeJavaScriptApplication(
+      const analysisPromise = analyzeJavaScriptApplication(
         {
           input_path: run.input.input_path,
           format: run.input.format ?? "auto",
@@ -309,17 +453,25 @@ export class WorkbenchRunManager {
         resources,
         { signal: entry.controller.signal, progress },
       );
+      await Promise.race([analysisPromise, timeoutPromise]);
+      // Cancellation must settle at the owner before cleanup or queue release.
+      // A timer cannot preempt synchronous JavaScript; checkpoints and the
+      // publication check below reject results that exceeded the deadline.
+      result = await analysisPromise;
+      checkDeadline();
     } catch (cause: unknown) {
-      result = {
-        ok: false,
-        error: cause instanceof Error ? cause : new Error(String(cause)),
-      } as never;
+      result = err(cause);
+    } finally {
+      if (timeoutHandle !== undefined) clearTimeout(timeoutHandle);
     }
+    if (entry.abortReason !== null) result = err({ code: entry.abortReason });
+    this.#store.updateRun(run.id, { state: "finalizing" });
     let cleanupStatus: "complete" | "failed" = "complete";
     try {
       await resources.close();
     } catch (cause: unknown) {
       cleanupStatus = "failed";
+      this.#failedCleanup.add(resources);
       this.#store.appendEvent({
         runId: run.id,
         type: "diagnostic.reported",
@@ -396,9 +548,8 @@ export class WorkbenchRunManager {
       });
       return;
     }
-    const cancelled =
-      entry.controller.signal.aborted ||
-      this.#store.getRun(run.id)?.state === "cancelling";
+    const timedOut = entry.abortReason === "analysis_timeout";
+    const cancelled = entry.abortReason === "user_cancelled";
     if (this.#activeStep !== undefined)
       this.#finishStep(
         run.id,
@@ -407,8 +558,15 @@ export class WorkbenchRunManager {
         describeError(result.error),
       );
     const finalState: WorkbenchRunState = cancelled ? "cancelled" : "failed";
-    const completeness: "partial" | "none" = cancelled ? "partial" : "none";
-    const error = projectWorkbenchError(result.error);
+    const completeness = "none" as const;
+    const error = timedOut
+      ? {
+          code: "analysis_timeout",
+          message: `分析超过 Workbench 运行时限 ${String(this.#runTimeoutMs)} ms。`,
+        }
+      : cancelled
+        ? { code: "user_cancelled", message: "用户请求取消运行。" }
+        : projectWorkbenchError(result.error);
     this.#store.updateRun(run.id, {
       state: finalState,
       resultCompleteness: completeness,
@@ -433,6 +591,8 @@ export class WorkbenchRunManager {
         state: finalState,
         result_completeness: completeness,
         cleanup_status: cleanupStatus,
+        ...(timedOut ? { cause: "timeout" } : {}),
+        ...(cancelled ? { cause: "user-cancelled" } : {}),
       },
     });
   }
@@ -558,3 +718,13 @@ const projectWorkbenchError = (error: unknown): Record<string, JsonValue> => ({
 
 const describeError = (error: unknown): string =>
   error instanceof Error ? error.message : String(error);
+
+const parseRunTimeout = (value: string | undefined): number => {
+  if (value === undefined) return 30 * 60 * 1000;
+  const parsed = Number(value);
+  if (!Number.isSafeInteger(parsed) || parsed <= 0 || parsed > 2_147_483_647)
+    throw new Error(
+      "REA_WORKBENCH_RUN_TIMEOUT_MS 必须是 1-2147483647 的整数。",
+    );
+  return parsed;
+};

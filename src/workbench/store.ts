@@ -119,6 +119,7 @@ export class WorkbenchStore {
   readonly #db: DatabaseSync;
   readonly #events = new EventEmitter();
   readonly #databasePath: string;
+  #transactionEvents: WorkbenchRunEvent[] | undefined;
 
   constructor(databasePath = defaultDatabasePath()) {
     this.#databasePath = databasePath;
@@ -203,6 +204,27 @@ export class WorkbenchStore {
 
   close(): void {
     this.#db.close();
+  }
+
+  /** Commit related durable state and events together; the callback is synchronous. */
+  transaction<T>(operation: () => T): T {
+    if (this.#transactionEvents !== undefined)
+      throw new Error("Nested Workbench transaction");
+    this.#db.exec("BEGIN IMMEDIATE");
+    const events: WorkbenchRunEvent[] = [];
+    this.#transactionEvents = events;
+    let value: T;
+    try {
+      value = operation();
+      this.#db.exec("COMMIT");
+    } catch (cause: unknown) {
+      this.#db.exec("ROLLBACK");
+      throw cause;
+    } finally {
+      this.#transactionEvents = undefined;
+    }
+    for (const event of events) this.#events.emit(`run:${event.runId}`, event);
+    return value;
   }
 
   onRunEvent(runId: string, listener: StoreEventListener): () => void {
@@ -427,6 +449,17 @@ export class WorkbenchStore {
     return rows.map((row) => this.#runFromRow(row));
   }
 
+  listRunsByStates(states: readonly WorkbenchRunState[]): WorkbenchRun[] {
+    if (states.length === 0) return [];
+    const placeholders = states.map(() => "?").join(", ");
+    const rows = this.#db
+      .prepare(
+        `SELECT * FROM runs WHERE state IN (${placeholders}) ORDER BY created_at ASC`,
+      )
+      .all(...states) as unknown as StoredRunRow[];
+    return rows.map((row) => this.#runFromRow(row));
+  }
+
   getRun(id: string): WorkbenchRun | null {
     const row = this.#db.prepare("SELECT * FROM runs WHERE id = ?").get(id) as
       | StoredRunRow
@@ -552,7 +585,9 @@ export class WorkbenchStore {
         event.attemptId,
         JSON.stringify(event.payload),
       );
-    this.#events.emit(`run:${event.runId}`, event);
+    if (this.#transactionEvents === undefined)
+      this.#events.emit(`run:${event.runId}`, event);
+    else this.#transactionEvents.push(event);
     return event;
   }
 
@@ -569,6 +604,18 @@ export class WorkbenchStore {
     const events = this.listEvents(runId);
     const steps = new Map<string, WorkbenchStepSnapshot>();
     for (const event of events) {
+      if (event.type === "run.interrupted") {
+        for (const [id, step] of steps) {
+          if (step.state === "running" || step.state === "waiting")
+            steps.set(id, {
+              ...step,
+              state: "interrupted",
+              finishedAt: event.timestamp,
+              message: "进程中断，步骤结果未知。",
+            });
+        }
+        continue;
+      }
       const id = event.stepInstanceId;
       if (id === null) continue;
       const payload = event.payload;

@@ -8,6 +8,7 @@ src/workbench/
 ├── server.ts          # loopback HTTP API、SSE 和内嵌浏览器 UI
 ├── store.ts           # SQLite schema、实体查询、事件日志和状态投影
 ├── runManager.ts      # 单 Worker 队列、取消、REA workflow 适配和清理
+├── recovery.ts        # 启动时原子投影遗留运行为 interrupted
 ├── sourceSnapshot.ts  # 运行级 ASAR 源码快照：固定身份、文件树、受限文本读取
 ├── bundleStore.ts     # Evidence Bundle：原子提交、摘要校验读取、孤儿回收
 ├── graphView.ts       # 图投影：分页、邻居、节点详情与跨运行差异（复用 REA 比较工作流）
@@ -36,11 +37,12 @@ npm run workbench
 
 可用环境变量：
 
-| 变量                     | 默认值                              | 作用             |
-| ------------------------ | ----------------------------------- | ---------------- |
-| `REA_WORKBENCH_PORT`     | `4317`                              | 监听端口         |
-| `REA_WORKBENCH_TOKEN`    | 启动时随机生成                      | 固定本地访问凭据 |
-| `REA_WORKBENCH_DATABASE` | `~/.rea-workbench/workbench.sqlite` | SQLite 路径      |
+| 变量                           | 默认值                              | 作用                             |
+| ------------------------------ | ----------------------------------- | -------------------------------- |
+| `REA_WORKBENCH_PORT`           | `4317`                              | 监听端口                         |
+| `REA_WORKBENCH_TOKEN`          | 启动时随机生成                      | 固定本地访问凭据                 |
+| `REA_WORKBENCH_DATABASE`       | `~/.rea-workbench/workbench.sqlite` | SQLite 路径                      |
+| `REA_WORKBENCH_RUN_TIMEOUT_MS` | `1800000`                           | 整次分析时限（毫秒，含快照准备） |
 
 ## 开发流程
 
@@ -70,6 +72,15 @@ npm run workbench
 1. 连接建立后先订阅实时事件（重叠到达的事件进入缓冲），再回放历史，最后按运行内序号（`sequence`）去重冲刷缓冲。
 2. 每帧携带 `id: <sequence>`；客户端断线后以 `Last-Event-ID` 头或 `after` 查询参数续传，服务端只发送序号更大的事件。
 3. 连接空闲时每 15 秒发送心跳注释；服务端发送 `retry: 3000` 提示浏览器自动重连间隔。
+
+## 运行恢复、重试和诊断（V1.2）
+
+- 启动先取得监听端口，恢复期间返回 `503 service_starting`；随后扫描 `queued/starting/running/finalizing/cancelling` 遗留运行。每个运行的状态修改与 `run.interrupted`、`run.finished` 事件在同一 SQLite 事务中提交，事件只在提交后推送。运行终态为 `interrupted`，完整性与清理状态均为 `unknown`，错误码为 `process_interrupted`；已有取消事件与 Evidence/Bundle 保留。启动摘要打印恢复数量。不尝试断点续跑。
+- `POST /api/runs/:id/retry`（请求体 `{}`）仅允许 `failed/cancelled/interrupted` 且工作流声明 `capabilities.retry: true` 的运行；其他状态返回 `409 retry_not_allowed`。重试剥离旧 `input_path`，通过登记目标重新解析路径，并保留其余调用参数。创建新 run-id、新 Bundle，`run.created.payload.retry_of_run_id` 链接原运行，历史记录不变。支持 `Idempotency-Key`，同键重放同一新运行，即使目标后来不可读也可重放。事件级 `attemptId` 保持 null，运行链表达本版本的重试身份。
+- 用户取消终态为 `cancelled`、错误码 `user_cancelled`；服务端超时终态为 `failed`、错误码 `analysis_timeout`，最终事件携带 `cause: "timeout"`；进程中断为 `interrupted/process_interrupted`。没有保留可用 Evidence 时完整性为 `none`，不因取消而宣称有 partial 结果。UI 上下文展示错误码与消息，并提供失败/取消/中断运行的重试按钮。
+- 分析时限默认 30 分钟，嵌入调用可用 `createWorkbenchServer({ runTimeoutMs })` 调整。超时通过 AbortController 与分析 Promise 竞速触发，并等待分析响应取消后再关闭资源或启动下一任务。时间戳检查覆盖进度边界与结果发布前；不能硬抢占当前进程中的同步 JavaScript 阶段，清理所需时间也可能超过时限。调用者的 `analysis_timeout_ms` 仍原样传给 REA（它是解析 Worker 的预算，与工作台整次时限不同）。
+- `GET /api/diagnostics` 需要凭据，返回 `queueLength`、`queuedRunIds`、`active {runId, step, startedAt}`、`lastStartupRecovery {recoveredRunIds, reasonCounts}`、`runTimeoutMs`、`databasePath` 和 `bundleRoot`，不修改内部状态。
+- 关闭服务先停止 HTTP 连接，取消待执行与活动分析并等待其完成，然后释放快照、重试失败资源的清理，最后关闭数据库。清理失败的资源保持由管理器持有。
 
 ## Evidence Bundle
 
@@ -103,11 +114,15 @@ npm run test:focused -- tests/boundary/workbench/workbenchApiContract.test.ts te
 npm run test:focused -- tests/boundary/workbench/workbenchAsarSource.test.ts
 npm run test:focused -- tests/boundary/workbench/workbenchEvidenceBundle.test.ts
 npm run test:focused -- tests/boundary/workbench/workbenchGraphDiff.test.ts
+npm run test:focused -- tests/boundary/workbench/workbenchRunRecovery.test.ts
 ```
 
 Workbench API 的契约与断线重连验收测试位于 `tests/boundary/workbench/`：契约测试在真实 loopback HTTP 服务器上覆盖鉴权、非法请求不写部分实体、幂等重放与冲突、真实 REA 分析的成功/失败/取消三条路径；SSE 测试用 `handle.store` 注入确定性事件，覆盖历史回放、实时合并不丢不重和 `Last-Event-ID`/`after` 续传；ASAR 测试用 `@electron/asar` 构造真实档案并跑完整分析，覆盖快照身份固定（覆盖目标后读取不变）、文件树、穿越拒绝、文本限制和读取预算。Bundle 测试覆盖原子提交、清单追溯、数据库分离、重启后读取、孤儿回收、篡改检测和提交失败降级。图差异测试覆盖同版本判定、增删回溯、覆盖守卫、游标翻页、邻居展开与 `include_graph_diff` 契约。存储模块语义（事件顺序、步骤投影、幂等绑定）的单元测试在 `src/server/workbenchStore.test.ts`。不要用模拟 Provider 宣称真实 REA Provider 已验证。
 
 ## 已知限制
+
+- V1.2 前端下一步采用轻量 TypeScript 组件化，复用现有编译链；React/Vite 推迟到明确需要相关能力时评估。
+- 数据库与 Bundle 仍按单个服务实例使用；不同端口访问同一数据库的并发实例不受支持。监听端口冲突会先于恢复失败，避免同端口重复启动修改活动运行。
 
 - Evidence Bundle 每次读取都重算 sha256，超大规模 Bundle 的读取成本随体积线性增长。
 - 图差异只比较 `analyze_javascript_application` 证据；native observations 侧通道（`left/right_native_observations`）暂未接入工作台差异。

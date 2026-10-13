@@ -3,6 +3,52 @@ import { describe, expect, it } from "vitest";
 import { WorkbenchStore, defaultWorkflow } from "../workbench/store.js";
 
 describe("WorkbenchStore", () => {
+  it("rolls back interrupted state and events together without notifying subscribers", () => {
+    const store = new WorkbenchStore(":memory:");
+    try {
+      const project = store.createProject("atomic recovery");
+      const target = store.createTarget(
+        project.id,
+        "/tmp/example",
+        "directory",
+      );
+      const run = store.createRun({
+        projectId: project.id,
+        targetId: target.id,
+        workflow: defaultWorkflow(),
+        parameters: {},
+      });
+      store.updateRun(run.id, { state: "running" });
+      store.appendEvent({
+        runId: run.id,
+        type: "step.started",
+        stepInstanceId: "inventory",
+      });
+      const delivered: string[] = [];
+      const remove = store.onRunEvent(run.id, (event) => {
+        delivered.push(event.type);
+      });
+      expect(() =>
+        store.transaction(() => {
+          store.updateRun(run.id, { state: "interrupted" });
+          store.appendEvent({ runId: run.id, type: "run.interrupted" });
+          throw new Error("persistence failed before commit");
+        }),
+      ).toThrow("persistence failed");
+      expect(store.getRun(run.id)?.state).toBe("running");
+      expect(store.listEvents(run.id)).toHaveLength(1);
+      expect(delivered).toEqual([]);
+      store.transaction(() => {
+        store.updateRun(run.id, { state: "interrupted" });
+        store.appendEvent({ runId: run.id, type: "run.interrupted" });
+      });
+      expect(delivered).toEqual(["run.interrupted"]);
+      expect(store.listSteps(run.id)[0]?.state).toBe("interrupted");
+      remove();
+    } finally {
+      store.close();
+    }
+  });
   it("persists ordered run events and projects step state", () => {
     const store = new WorkbenchStore(":memory:");
     const project = store.createProject("test project");

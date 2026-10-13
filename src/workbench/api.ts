@@ -24,6 +24,7 @@ export type WorkbenchApiErrorCode =
   | "target_unreadable"
   | "workflow_not_found"
   | "run_rejected"
+  | "retry_not_allowed"
   | "source_snapshot_unavailable"
   | "source_not_file"
   | "source_not_text"
@@ -34,6 +35,7 @@ export type WorkbenchApiErrorCode =
   | "malformed_body"
   | "idempotency_key_conflict"
   | "bundle_integrity_failed"
+  | "service_starting"
   | "internal_error";
 
 export const WORKBENCH_ERROR_STATUS: Readonly<
@@ -52,6 +54,7 @@ export const WORKBENCH_ERROR_STATUS: Readonly<
   target_unreadable: 400,
   workflow_not_found: 400,
   run_rejected: 400,
+  retry_not_allowed: 409,
   source_snapshot_unavailable: 400,
   source_not_file: 400,
   source_not_text: 400,
@@ -62,6 +65,7 @@ export const WORKBENCH_ERROR_STATUS: Readonly<
   malformed_body: 400,
   idempotency_key_conflict: 409,
   bundle_integrity_failed: 500,
+  service_starting: 503,
   internal_error: 500,
 };
 
@@ -181,6 +185,8 @@ export const createComparisonBodySchema = z.object({
   include_graph_diff: z.boolean().optional(),
 });
 
+export const retryRunBodySchema = z.object({}).strict();
+
 /** Parse a JSON object body and validate it against a schema. */
 export const parseJsonBody = async <Schema extends z.ZodType>(
   request: IncomingMessage,
@@ -239,6 +245,9 @@ export const runRequestDigest = (input: {
     input.workflowVersion,
     input.parameters,
   ]);
+
+export const retryRequestDigest = (runId: string): string =>
+  JSON.stringify(["retry", runId]);
 
 /** Response shapes shared by the HTTP handlers and contract tests. */
 export interface WorkbenchFileEntry {

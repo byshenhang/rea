@@ -8,6 +8,9 @@ process.stdout.write(
 process.stdout.write(`本地访问凭据: ${workbench.token}\n`);
 process.stdout.write(`数据目录: ${workbench.store.databasePath}\n`);
 process.stdout.write(`Bundle 目录: ${workbench.bundles.root}\n`);
+process.stdout.write(
+  `启动中断恢复: ${String(listenReport.runRecovery.recoveredRunIds.length)} 个运行\n`,
+);
 if (
   listenReport.orphanBundlesRemoved > 0 ||
   listenReport.orphanBundlesFailed > 0

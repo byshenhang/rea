@@ -76,6 +76,8 @@ RunEvent 由服务端分配运行内递增序号，先写 SQLite 再推送 SSE�
 | GET      | `/api/runs/:id/events`          | SSE 事件；`format=json` 返回历史事件 |
 | GET      | `/api/runs/:id/steps`           | 步骤状态投影                         |
 | POST     | `/api/runs/:id/cancel`          | 请求取消                             |
+| POST     | `/api/runs/:id/retry`           | 新运行重试，支持幂等键               |
+| GET      | `/api/diagnostics`              | 队列、Worker、启动恢复和数据路径     |
 | GET      | `/api/runs/:id/graph`           | 有界关系图子集                       |
 | GET      | `/api/runs/:id/evidence`        | 完整 Evidence                        |
 | GET      | `/api/runs/:id/export`          | 下载带 Evidence 身份的 JSON          |
